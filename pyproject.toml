@@ -1,0 +1,21 @@
+[project]
+name = "gpt-fast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "transformers",
+    "sentencepiece",
+    "tiktoken",
+    "blobfile",
+    "dotenv>=0.9.9",
+    "setuptools>=75.8.2",
+    "torch>=2.6.0",
+    "triton>=3.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+]
