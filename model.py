@@ -112,6 +112,7 @@ class KVCache(nn.Module):
 
         return k_out, v_out
 
+
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -135,7 +136,7 @@ class Transformer(nn.Module):
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
-        dtype = self.output.weight.dtype
+        dtype = self.layers[0].feed_forward.w1.weight.dtype
         # For quantized layers, dtype is encoded in scales
         if hasattr(self.output, "scales"):
             dtype = self.output.scales.dtype
@@ -302,3 +303,88 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
 
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
+
+class TransformerShard(Transformer):
+    def __init__(self, rank: int, world_size: int, model: Transformer) -> None:
+        # Save parameters
+        self.stage = rank
+        self.num_stages = world_size
+        self.__dict__.update(model.__dict__)
+
+        # Setup sharded model
+        layer_indices = TransformerShard.distribute_layers(stage=rank, num_stages=world_size, num_layers=model.config.n_layer)
+        self.tok_embeddings = model.tok_embeddings if self.is_first_stage else nn.Identity()
+        self.layers = nn.ModuleList([model.layers[i] for i in layer_indices])
+        self.norm = model.norm if self.is_last_stage else nn.Identity()
+        self.output = model.output if self.is_last_stage else nn.Identity()
+
+        del model
+
+    @property
+    def is_first_stage(self) -> bool:
+        return self.stage == 0
+
+    @property
+    def is_last_stage(self) -> bool:
+        return self.stage == self.num_stages - 1
+
+    @staticmethod
+    def distribute_layers(stage: int, num_stages: int, num_layers: int) -> list[int]:
+        layers_per_gpu = [num_layers // num_stages + (1 if i < num_layers % num_stages else 0) for i in range(num_stages)]
+        start_layer = sum(layers_per_gpu[:stage])
+        return list(range(start_layer, start_layer + layers_per_gpu[stage]))
+
+if __name__ == "__main__":
+    print("Running model.py")
+
+    device = "cpu"
+
+    def get_model():
+        # Load model architecture
+        from pathlib import Path
+        checkpoint_path = Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth")
+        with torch.device('meta'):
+            model = Transformer.from_name(checkpoint_path.parent.name)
+        
+        # Load weights
+        checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
+        if "model" in checkpoint and "stories" in str(checkpoint_path):
+            checkpoint = checkpoint["model"]
+        model.load_state_dict(checkpoint, assign=True)
+
+        return model
+
+    world_size = 2
+    def get_shard(rank: int) -> TransformerShard:
+        print(f"Getting shard for rank {rank}")
+        return TransformerShard(rank=rank, world_size=world_size, model=get_model())
+
+    # Load full model and model shards
+    model = get_model()
+    model1 = get_shard(rank=0)
+    model2 = get_shard(rank=1)
+
+    # Setup caches
+    batch_size = 1
+    seq_length = 32  # Or any reasonable sequence length for testing
+    model.setup_caches(max_batch_size=batch_size, max_seq_length=seq_length)
+    model1.setup_caches(max_batch_size=batch_size, max_seq_length=seq_length)
+    model2.setup_caches(max_batch_size=batch_size, max_seq_length=seq_length)
+
+    # Test tokens
+    test_tokens = torch.randint(0, model1.config.vocab_size, (batch_size, 4))
+    input_pos = torch.arange(test_tokens.size(-1))
+
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def causal_mask(b, h, q, kv):
+        return q >= kv
+
+    mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model1.max_seq_length, device=device)
+
+    out = model(mask, test_tokens, input_pos)
+
+    hidden_states = model1(mask, test_tokens, input_pos)
+    shard_out = model2(mask, hidden_states, input_pos)
+
+    import code; code.interact(local=dict(globals(), **locals()))
