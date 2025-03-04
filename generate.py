@@ -193,7 +193,6 @@ def main(
     checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
     compile: bool = True,
     compile_prefill: bool = False,
-    profile: Optional[Path] = None,
     device=default_device,
     precision: torch.dtype = torch.bfloat16,
 ) -> None:
@@ -232,13 +231,6 @@ def main(
         global create_block_mask
         create_block_mask = torch.compile(create_block_mask)
 
-        if False and False: # and ("cuda" in device):
-            torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
-
-        if False:
-            global model_forward, logits_to_prob
-            model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
-
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
@@ -247,85 +239,38 @@ def main(
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
 
 
-    aggregate_metrics = {
-        'tokens_per_sec': [],
-        'accept_counts': [],
-    }
+    aggregate_metrics = {'tokens_per_sec': []}
     start = -1 if compile else 0
-
     for i in range(start, num_samples):
-        device_sync(device=device) # MKG
-        if i >= 0 and False:
-            prompt = input("What is your prompt? ")
-            if False:
-                prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-            encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-
-        if False and i >= 0:
-            buffer = []
-            period_id = tokenizer.encode('.')[0]
-            done_generating = False
-            def callback(x):
-                nonlocal done_generating
-                if done_generating:
-                    return
-                buffer.append(tokenizer.decode([period_id] + x.tolist())[1:])
-                if x.item() == tokenizer.eos_id():
-                    done_generating = True
-                if len(buffer) == 4 or done_generating:
-                    print(''.join(buffer), end='', flush=True)
-                    buffer.clear()
-                # print(, end='', flush=True)
-        else:
-            callback = lambda x : x
+        device_sync(device=device)
         t0 = time.perf_counter()
-        import contextlib
-        if (i != num_samples - 1 or not profile):
-            prof = contextlib.nullcontext()
-        else:
-            torch.profiler._utils._init_for_cuda_graphs()
-            prof = torch.profiler.profile()
-        with prof:
-            y = generate(
-                model,
-                encoded,
-                max_new_tokens,
-                batch_size=batch_size,
-                temperature=temperature,
-                top_k=top_k,
-            )
+        decoded = generate(
+            model,
+            encoded,
+            max_new_tokens,
+            batch_size=batch_size,
+            temperature=temperature,
+            top_k=top_k,
+        )
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
-        if hasattr(prof, "export_chrome_trace"):
-            if False:
-                prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
-            else:
-                prof.export_chrome_trace(f"{profile}.json")
-        device_sync(device=device) # MKG
+        device_sync(device=device)
         t = time.perf_counter() - t0
 
-        if not False:
-            # Just displaying the first generation
-            if batch_size > 1:
-                print("Only displaying the first generation of the batch")
-            print(tokenizer.decode(y[0].tolist()))
-        else:
-            print()
-        tokens_generated = y.size(-1) - encoded.size(-1)
+        # Just displaying the first generation
+        if batch_size > 1:
+            print("Only displaying the first generation of the batch")
+        print(tokenizer.decode(decoded[0].tolist()))
+        tokens_generated = decoded.size(-1) - encoded.size(-1)
         generated_tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(generated_tokens_sec)
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {generated_tokens_sec:.02f} tokens/sec")
         print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
-        total_tokens_sec = y.numel() / t
+        total_tokens_sec = decoded.numel() / t
         print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
         print()
     print("==========")
-    if False:
-        counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
-        acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
-        print(f"Acceptance probs: {acceptance_probs}")
-        print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
     print(f"Batch Size: {batch_size}")
     print(f"Prompt Length: {encoded.size(-1)}")
@@ -346,11 +291,10 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
-    parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     args = parser.parse_args()
     main(
         args.prompt, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.device
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.device
     )
