@@ -31,8 +31,6 @@ torch._functorch.config.enable_autograd_cache = True
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-create_block_mask = torch.compile(create_block_mask)
-
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
@@ -307,8 +305,7 @@ def main(
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
     global print
-    from tp import maybe_init_dist
-    rank = maybe_init_dist()
+    rank = None
     use_tp = rank is not None
     if use_tp:
         if rank != 0:
@@ -344,6 +341,9 @@ def main(
     torch.manual_seed(1234)
     model_size, params = _get_model_size(model)
     if compile:
+        global create_block_mask
+        create_block_mask = torch.compile(create_block_mask)
+
         if is_speculative and use_tp: # and ("cuda" in device):
             torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
 
