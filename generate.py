@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+import torch.distributed as dist
 import torch._dynamo.config
 import torch._inductor.config
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -70,12 +71,26 @@ def roundup(val: float, multiplier: float) -> int:
 def causal_mask(b, h, q, kv):
     return q >= kv
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
+def prefill(model: Transformer, x: Optional[Tensor], input_pos: Tensor, **sampling_kwargs) -> Optional[Tensor]:
     """Prefill the model with the given input """
     # input_pos: [B, S]
     mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
-    logits = model(mask, x, input_pos)
-    return sample(logits, **sampling_kwargs)[0]
+    
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    if rank != 0: # all but first rank
+        print(f"[{rank}] waiting for input")
+        dist.recv(x, src=(rank-1) % world_size)
+
+    print(f"[{rank}] forward")
+    output = model(mask, x, input_pos)
+
+    if rank != world_size - 1: # all but last rank
+        print(f"[{rank}] sending output")
+        dist.send(output, dst=(rank+1) % world_size)
+        return
+
+    return sample(output, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, block_mask: BlockMask, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     """Decode one token"""
@@ -134,7 +149,11 @@ def generate(
 
     # Prefill prompt tokens
     seq = empty
+    print("running prefill")
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    print(f"{next_token=}")
+    import code; code.interact(local=dict(globals(), **locals()))
+    sys.exit(0)
     seq[:, num_prompt_tokens] = next_token.squeeze()
 
     # Decode remaining tokens
@@ -206,6 +225,13 @@ def main(
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     assert tokenizer_path.is_file(), str(tokenizer_path)
 
+    # Initialize distributed process group
+    dist.init_process_group()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    print(f"{rank=}", f"{world_size=}")
+
+    # Load model
     print(f"Using device={device}")
     print(f"Using precision={precision}")
 
@@ -215,6 +241,11 @@ def main(
     model = load_model(checkpoint_path, device, precision)
     device_sync(device=device) 
     print(f"Loaded model in {time.time() - t0:.02f} seconds")
+
+    # Shard model
+    if world_size > 1:
+        from model import shard_model
+        model = shard_model(model, rank, world_size)
 
     # Load tokenizer
     print("Loading tokenizer ...", end="\r")

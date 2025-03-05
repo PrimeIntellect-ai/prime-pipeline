@@ -334,6 +334,9 @@ class TransformerShard(Transformer):
         start_layer = sum(layers_per_gpu[:stage])
         return list(range(start_layer, start_layer + layers_per_gpu[stage]))
 
+def shard_model(model: Transformer, rank: int, world_size: int) -> TransformerShard:
+    return TransformerShard(rank=rank, world_size=world_size, model=model)
+
 if __name__ == "__main__":
     print("Running model.py")
 
