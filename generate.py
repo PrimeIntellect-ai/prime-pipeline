@@ -65,44 +65,54 @@ def causal_mask(b, h, q, kv):
 
 def pipelined_forward(model: Transformer, mask: Tensor, x: Tensor, input_pos: Tensor, logger: "loguru.Logger", **sampling_kwargs) -> Tensor:
     """Pipelined forward pass"""
+    logger.debug(f"Calling pipelined_forward(model, {mask=}, {x.shape=}, {input_pos.shape})")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if rank != 0: # all but first rank receive hidden states
         x = torch.empty((x.size(0), x.size(1), 4096), device=x.device, dtype=torch.bfloat16)
-        logger.debug(f"Receiving tensor {x.shape=}, {x.dtype=}, {x.device=}")
+        logger.debug(f"Receiving hidden states {x.shape=}, {x.dtype=}, {x.device=}")
         dist.recv(x, src=(rank-1) % world_size)
-        logger.debug(f"Got tensor {x.shape=}, {x.dtype=}, {x.device=}")
+        logger.debug(f"Got hidden states {x.shape=}, {x.dtype=}, {x.device=}")
 
     output = model(mask, x, input_pos)
     logger.debug(f"Computed output {output.shape=}")
 
     if rank != world_size - 1: # all but last rank
-        logger.debug(f"Sending output to {rank+1} % {world_size}")
-        dist.send(output, dst=(rank+1) % world_size)
+        logger.debug(f"Sending output to 1")
+        dist.send(output, dst=1)
         next_token = torch.empty(size=(x.size(0), 1), dtype=x.dtype, device=x.device)
-        logger.debug(f"Receiving next token from final stage")
+        logger.debug(f"Receiving tokens from 1")
         dist.recv(next_token, src=1)
+        logger.debug(f"Got tokens {next_token=}, {next_token.shape=}, {next_token.dtype=}, {next_token.device=}")
     else:
         next_token = sample(output, **sampling_kwargs)[0]
-        logger.debug(f"Sending next token to first stage")
+        logger.debug(f"Sampled next token {next_token=}, {next_token.shape=}, {next_token.dtype=}, {next_token.device=}")
         if dist.get_world_size() > 1:
+            logger.debug(f"Sending next token to 0")
             dist.send(next_token, dst=0)
+
     return next_token
 
 def prefill(model: Transformer, x: Optional[Tensor], input_pos: Tensor, logger: "loguru.Logger", **sampling_kwargs) -> Optional[Tensor]:
     """Prefill the model with the given input """
     # input_pos: [B, S]
+    logger.debug(f"Calling prefill(model, {x.shape=}, {input_pos.shape=})")
+    logger.debug(f"Creating mask")
     mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=x.device)
+    logger.debug(f"{mask=}")
     return pipelined_forward(model, mask, x, input_pos, logger, **sampling_kwargs)
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, block_mask: BlockMask, logger: "loguru.Logger", **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     """Decode one token"""
     # input_pos: [B, 1]
+    logger.debug(f"Calling decode_one_token(model, {x.shape=}, {input_pos.shape=}, {block_mask=})")
     assert input_pos.shape[-1] == 1
+    logger.debug(f"Adjusting mask")
     block_index = input_pos // block_mask.BLOCK_SIZE[0]
     mask = block_mask[:, :, block_index]
     mask.mask_mod = block_mask.mask_mod
     mask.seq_lengths = (1, model.max_seq_length)
+    logger.debug(f"{mask=}")
 
     next_token = pipelined_forward(model, mask, x, input_pos, logger, **sampling_kwargs)
     logger.debug(f"Decoded next token {next_token.squeeze().tolist()}")
@@ -111,7 +121,11 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, logger: "loguru.Logger", **sampling_kwargs):
     """Decode n tokens"""
+    logger.debug(f"Calling decode_n_tokens({cur_token=} ({cur_token.shape=}), {input_pos=} ({input_pos.shape=}), {num_new_tokens=}, {sampling_kwargs=})")
+    logger.debug(f"Creating block mask")
     block_mask = create_block_mask(causal_mask, 1, 1, model.max_seq_length, model.max_seq_length, device=cur_token.device)
+    logger.debug(f"{block_mask=}")
+
     new_tokens = []
     for i in range(num_new_tokens):
         next_token = decode_one_token(
@@ -150,9 +164,7 @@ def generate(
 
     # Prefill prompt tokens
     seq = empty
-    logger.debug("Running prefill")
     next_token = prefill(model=model, x=prompt.view(batch_size, -1), input_pos=input_pos, logger=logger, **sampling_kwargs)
-    logger.debug(f"Done prefilling, sampled next_token={next_token.squeeze().tolist()}")
 
     # Decode remaining tokens
     seq[:, num_prompt_tokens] = next_token.squeeze()
