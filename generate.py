@@ -15,6 +15,8 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from world import World
 
+from lovely_tensors import monkey_patch; monkey_patch()
+
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -129,13 +131,55 @@ def pipelined_forward(model: Transformer, mask: Tensor, batched_prompt: tuple[Te
 
     return next_tokens
 
-def prefill(model: Transformer, batched_prompt: tuple[Tensor], input_pos: Tensor, logger: "loguru.Logger", **sampling_kwargs) -> Optional[Tensor]:
+def prefill(model: Transformer, batched_prompt: tuple[Tensor], input_pos: Tensor, micro_batch_size: int, logger: "loguru.Logger", **sampling_kwargs) -> Optional[Tensor]:
     """Prefill the model with the given input """
     # input_pos: [B, S]
     logger.debug(f"Calling prefill(model, {len(batched_prompt)=}, {batched_prompt[0].shape=}, {input_pos.shape=})")
     mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model.max_seq_length, device=batched_prompt[0].device)
-    # logger.debug(f"{mask=}")
-    next_tokens = pipelined_forward(model, mask, batched_prompt, input_pos, logger, **sampling_kwargs)
+
+    batch_size = batched_prompt[0].shape[0]
+    tokens_shape = (micro_batch_size, 1)
+    tokens_dtype = torch.long  # TODO: dont hardcode
+    hidden_states_shape = (micro_batch_size, batched_prompt[0].size(1), 4096)
+    hidden_states_dtype = torch.float16 # TODO: dont hardcode
+    device = batched_prompt[0].device
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    all_tokens = []
+    if world_size == 1:
+        for i, prompt in enumerate(batched_prompt):
+            logits = model(i, mask, prompt, input_pos)
+            all_tokens.append(sample(logits, **sampling_kwargs)[0])
+        next_tokens = torch.cat(all_tokens, dim=0)
+    else:
+        if rank == 0:
+            for i, prompt in enumerate(batched_prompt):
+                hidden_states = model(i, mask, prompt, input_pos)
+                logger.debug(f"Sending hidden states {i}, {hidden_states=}")
+                dist.send(hidden_states, dst=1, tag=i)
+                logger.debug(f"Sent hidden states {i}, {hidden_states=}")
+                next_tokens = torch.empty(size=tokens_shape, dtype=tokens_dtype, device=device)
+                logger.debug(f"Receiving tokens {i} {next_tokens=}")
+                dist.recv(next_tokens, src=1, tag=i)
+                logger.debug(f"Got tokens {next_tokens=}")
+                all_tokens.append(next_tokens)
+            next_tokens = torch.cat(all_tokens, dim=0)
+        elif rank == world_size - 1:
+            for i, prompt in enumerate(batched_prompt):
+                hidden_states = torch.empty(size=hidden_states_shape, dtype=hidden_states_dtype, device=device)
+                logger.debug(f"Receiving hidden states {i} {hidden_states=}")
+                dist.recv(hidden_states, src=0, tag=i)
+                logger.debug(f"Got hidden states {hidden_states=}")
+                logits = model(i, mask, hidden_states, input_pos)
+                next_token = sample(logits, **sampling_kwargs)[0]
+                logger.debug(f"Sending tokens {i}, {next_token=}")
+                dist.send(next_token, dst=0, tag=i)
+                logger.debug(f"Sent tokens {i}, {next_token=}")
+                all_tokens.append(next_token)
+            next_tokens = torch.cat(all_tokens, dim=0)
+        else:
+            raise NotImplementedError
     logger.debug(f"Prefilled next tokens {next_tokens.squeeze().tolist()}")
     return next_tokens
 
@@ -157,18 +201,97 @@ def decode_one_token(model: Transformer, batched_cur_token: torch.Tensor, input_
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, micro_batch_size: int, input_pos: torch.Tensor, num_new_tokens: int, logger: "loguru.Logger", **sampling_kwargs):
     """Decode n tokens"""
-    logger.debug(f"Calling decode_n_tokens({cur_token=} ({cur_token.shape=}), {input_pos=} ({input_pos.shape=}), {num_new_tokens=}, {sampling_kwargs=})")
+    # cur_token: [B, 1]
+
+    # Setup shapes, dtypes, devicec
+    batch_size = cur_token.shape[0]
+    num_micro_batches = batch_size // micro_batch_size
+    tokens_shape = (micro_batch_size, 1)
+    tokens_dtype = torch.long  # TODO: dont hardcode
+    hidden_states_shape = (micro_batch_size, 1, 4096)
+    hidden_states_dtype = torch.float16 # TODO: dont hardcode
+    device = cur_token.device
+    logger.debug(f"{tokens_shape=}, {tokens_dtype=}")
+    logger.debug(f"{hidden_states_shape=}, {hidden_states_dtype=}")
+    logger.debug(f"{device=}")
+    
+    # Create block mask
     block_mask = create_block_mask(causal_mask, 1, 1, model.max_seq_length, model.max_seq_length, device=cur_token.device)
+    logger.debug(f"Create block mask")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    def setup_mask(input_pos):
+        assert input_pos.shape[-1] == 1
+        block_index = input_pos // block_mask.BLOCK_SIZE[0]
+        mask = block_mask[:, :, block_index]
+        mask.mask_mod = block_mask.mask_mod
+        mask.seq_lengths = (1, model.max_seq_length)
+        return mask
 
     new_tokens = []
-    for _ in range(num_new_tokens):
-        batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
-        next_token = decode_one_token(
-            model, batched_cur_token, input_pos, block_mask, logger, **sampling_kwargs
-        )
-        input_pos += 1
-        new_tokens.append(next_token.clone())
-        cur_token = next_token.clone()
+    if world_size == 1: # single node
+        for _ in range(num_new_tokens):
+            batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
+            mask = setup_mask(input_pos)
+            next_tokens = []
+            for i, cur_token in enumerate(batched_cur_token):
+                logits = model(i, mask, cur_token, input_pos)
+                next_tokens.append(sample(logits, **sampling_kwargs)[0])
+            next_tokens = torch.cat(next_tokens, dim=0)
+            input_pos += 1
+            new_tokens.append(next_tokens.clone())
+            cur_token = next_tokens.clone()
+
+    else: # multi-node
+        # allocate buffers
+        send_reqs = [None] * num_micro_batches     # Store send requests
+        recv_buffers = [None] * num_micro_batches  # Store tensors being received
+        recv_reqs = [None] * num_micro_batches     # Store receive requests
+
+        if rank == 0: # first stage
+            for _ in range(num_new_tokens): # decoding steps
+                batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
+                mask = setup_mask(input_pos)
+                batched_next_tokens = []
+                for i, cur_token in enumerate(batched_cur_token):
+                    hidden_states = model(i, mask, cur_token, input_pos)
+                    logger.debug(f"Sending hidden states {i}, {hidden_states=}")
+                    dist.send(hidden_states, dst=1, tag=i)
+                    logger.debug(f"Sent hidden states {i}, {hidden_states=}")
+                    next_tokens = torch.empty(tokens_shape, dtype=tokens_dtype, device=device)
+                    logger.debug(f"Receiving tokens {i}, {next_tokens=}")
+                    dist.recv(next_tokens, src=1, tag=i)
+                    logger.debug(f"Got tokens {next_tokens=}")
+                    batched_next_tokens.append(next_tokens)
+                next_tokens = torch.cat(batched_next_tokens, dim=0)
+                cur_token = next_tokens.clone()
+                input_pos += 1
+                new_tokens.append(next_tokens.clone())
+
+        elif rank == world_size - 1: # last stage
+            for _ in range(num_new_tokens): # decoding steps
+                batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
+                mask = setup_mask(input_pos)
+                batched_next_tokens = []
+                for i, cur_token in enumerate(batched_cur_token):
+                    hidden_states = torch.empty(hidden_states_shape, dtype=hidden_states_dtype, device=device)
+                    logger.debug(f"Receiving hidden states {i}, {hidden_states=}")
+                    dist.recv(hidden_states, src=0, tag=i)
+                    logger.debug(f"Got hidden states {i}, {hidden_states=}")
+                    logits = model(i, mask, hidden_states, input_pos)
+                    next_tokens = sample(logits, **sampling_kwargs)[0]
+                    logger.debug(f"Sending tokens {i}, {next_tokens=}")
+                    dist.send(next_tokens, dst=0, tag=i)
+                    logger.debug(f"Sent tokens {i}, {next_tokens=}")
+                    batched_next_tokens.append(next_tokens)
+                next_tokens = torch.cat(batched_next_tokens, dim=0)
+                cur_token = next_tokens.clone()
+                input_pos += 1
+                new_tokens.append(next_tokens.clone())
+        else:
+            raise NotImplementedError
 
     return new_tokens
 
@@ -188,7 +311,7 @@ def generate(
     seq_length = min(num_prompt_tokens + num_new_tokens, model.config.block_size) # Cap at model context
 
     # Setup microbatching
-    num_micro_batches = world.size
+    num_micro_batches = 2
     micro_batch_size = batch_size // num_micro_batches
     assert batch_size % num_micro_batches == 0
 
@@ -206,7 +329,7 @@ def generate(
 
     # Prefill prompt tokens
     seq = empty
-    next_token = prefill(model=model, batched_prompt=batched_prompt, input_pos=input_pos, logger=logger, **sampling_kwargs)
+    next_token = prefill(model=model, batched_prompt=batched_prompt, input_pos=input_pos, micro_batch_size=micro_batch_size, logger=logger, **sampling_kwargs)
 
     # Decode remaining tokens
     seq[:, num_prompt_tokens] = next_token.squeeze()
@@ -327,7 +450,6 @@ def main(
         logger.info(f"Throughput: {torch.mean(torch.tensor(metrics['tps'])).item():.2f} tokens/second")
         logger.info(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
-    import code; code.interact(local=dict(globals(), **locals()))
     dist.destroy_process_group()
 
 if __name__ == '__main__':
