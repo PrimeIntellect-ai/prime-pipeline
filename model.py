@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -95,22 +96,24 @@ transformer_configs = {
 }
 
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(self, num_micro_batches, max_micro_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
         super().__init__()
-        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        cache_shape = (num_micro_batches, max_micro_batch_size, n_heads, max_seq_length, head_dim)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        cache_bytes = 2 * self.k_cache.numel() * 2
 
-    def update(self, input_pos, k_val, v_val):
+    def update(self, micro_batch_idx, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
 
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
 
-        return k_out, v_out
+        k_out[micro_batch_idx, :, :, input_pos, :] = k_val.unsqueeze(0)
+        v_out[micro_batch_idx, :, :, input_pos, :] = v_val.unsqueeze(0)
+
+        return k_out[micro_batch_idx], v_out[micro_batch_idx]
 
 
 class Transformer(nn.Module):
@@ -129,13 +132,13 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
         self.get_mask_mod = get_mask_mod
 
-    def setup_caches(self, max_batch_size, max_seq_length):
-        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+    def setup_caches(self, num_micro_batches, max_micro_batch_size, max_seq_length):
+        if self.max_seq_length >= max_seq_length and self.max_batch_size >= num_micro_batches * max_micro_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
-        self.max_batch_size = max_batch_size
+        self.max_batch_size = num_micro_batches * max_micro_batch_size
         dtype = self.layers[0].feed_forward.w1.weight.dtype
         # For quantized layers, dtype is encoded in scales
         if hasattr(self.output, "scales"):
@@ -143,18 +146,19 @@ class Transformer(nn.Module):
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+            b.attention.kv_cache = KVCache(num_micro_batches, max_micro_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
 
-    def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, micro_batch_idx: int, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None, logger = None) -> Tensor:
+        # time.sleep(1)
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            x = layer(micro_batch_idx, x, input_pos, freqs_cis, mask)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -172,8 +176,8 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+    def forward(self, micro_batch_idx: int, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
+        h = x + self.attention(micro_batch_idx, self.attention_norm(x), freqs_cis, mask, input_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -202,7 +206,7 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, micro_batch_idx: int, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -218,7 +222,7 @@ class Attention(nn.Module):
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            k, v = self.kv_cache.update(micro_batch_idx, input_pos, k, v)
 
         y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
 
@@ -341,38 +345,29 @@ if __name__ == "__main__":
     print("Running model.py")
 
     device = "cpu"
-
-    def get_model():
-        # Load model architecture
-        from pathlib import Path
-        checkpoint_path = Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth")
-        with torch.device('meta'):
-            model = Transformer.from_name(checkpoint_path.parent.name)
-        
-        # Load weights
-        checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
-        if "model" in checkpoint and "stories" in str(checkpoint_path):
-            checkpoint = checkpoint["model"]
-        model.load_state_dict(checkpoint, assign=True)
-
-        return model
+    dtype = torch.float16
 
     world_size = 2
     def get_shard(rank: int) -> TransformerShard:
         print(f"Getting shard for rank {rank}")
-        return TransformerShard(rank=rank, world_size=world_size, model=get_model())
+        return TransformerShard(rank=rank, world_size=world_size, model=load_model(checkpoint_path=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), device=device, precision=dtype))
 
     # Load full model and model shards
-    model = get_model()
+    from utils import load_model
+    from pathlib import Path
+    model = load_model(checkpoint_path=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), device=device, precision=dtype)
     model1 = get_shard(rank=0)
     model2 = get_shard(rank=1)
 
     # Setup caches
-    batch_size = 1
+    batch_size = 16
+    num_micro_batches = 2
+    micro_batch_size = batch_size // num_micro_batches
+
     seq_length = 32  # Or any reasonable sequence length for testing
-    model.setup_caches(max_batch_size=batch_size, max_seq_length=seq_length)
-    model1.setup_caches(max_batch_size=batch_size, max_seq_length=seq_length)
-    model2.setup_caches(max_batch_size=batch_size, max_seq_length=seq_length)
+    model.setup_caches(num_micro_batches=1, max_micro_batch_size=batch_size, max_seq_length=seq_length)
+    model1.setup_caches(num_micro_batches=num_micro_batches, max_micro_batch_size=micro_batch_size, max_seq_length=seq_length)
+    model2.setup_caches(num_micro_batches=num_micro_batches, max_micro_batch_size=micro_batch_size, max_seq_length=seq_length)
 
     # Test tokens
     test_tokens = torch.randint(0, model1.config.vocab_size, (batch_size, 4))
@@ -385,9 +380,15 @@ if __name__ == "__main__":
 
     mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model1.max_seq_length, device=device)
 
-    out = model(mask, test_tokens, input_pos)
+    out = model(0, mask, test_tokens, input_pos)
 
-    hidden_states = model1(mask, test_tokens, input_pos)
-    shard_out = model2(mask, hidden_states, input_pos)
+    split_test_tokens = torch.split(test_tokens, micro_batch_size, dim=0)
+    shards_out = []
+    for i, split_test_token in enumerate(split_test_tokens):
+        hidden_states = model1(i, mask, split_test_token, input_pos)
+        shard_out = model2(i, mask, hidden_states, input_pos)
+        shards_out.append(shard_out)
+
+    shards_out = torch.cat(shards_out, dim=0)
 
     import code; code.interact(local=dict(globals(), **locals()))
