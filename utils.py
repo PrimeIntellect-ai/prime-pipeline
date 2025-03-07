@@ -16,9 +16,9 @@ def setup_world():
 def setup_logger(rank: int, console_level: str = "INFO", file_level: str = "DEBUG"):
     from loguru import logger
     console_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> [<level>{level}</level>] [<level>Rank {extra[rank]}</level>] - <level>{message}</level>"
-    file_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> [<level>{level}</level>] [<level>Rank {extra[rank]}</level>] - <level>{message}</level>"
+    # file_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> [<level>{level}</level>] [<level>Rank {extra[rank]}</level>] - <level>{message}</level>"
     logger.remove()
-    logger.add(f'logs/process_{rank}.log', level=file_level, format=file_format, mode='w')
+    # logger.add(f'logs/process_{rank}.log', level=file_level, format=file_format, mode='w')
     logger.add(sys.stdout, level=console_level, format=console_format)
     logger = logger.bind(rank=rank)
 
