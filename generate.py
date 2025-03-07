@@ -155,7 +155,7 @@ def prefill(model: Transformer, batched_prompt: tuple[Tensor], input_pos: Tensor
     else:
         if rank == 0:
             for i, prompt in enumerate(batched_prompt):
-                hidden_states = model(i, mask, prompt, input_pos)
+                hidden_states = model(i, mask, prompt, input_pos, logger)
                 logger.debug(f"Sending hidden states {i}, {hidden_states=}")
                 dist.send(hidden_states, dst=1, tag=i)
                 logger.debug(f"Sent hidden states {i}, {hidden_states=}")
@@ -171,7 +171,7 @@ def prefill(model: Transformer, batched_prompt: tuple[Tensor], input_pos: Tensor
                 logger.debug(f"Receiving hidden states {i} {hidden_states=}")
                 dist.recv(hidden_states, src=0, tag=i)
                 logger.debug(f"Got hidden states {hidden_states=}")
-                logits = model(i, mask, hidden_states, input_pos)
+                logits = model(i, mask, hidden_states, input_pos, logger)
                 next_token = sample(logits, **sampling_kwargs)[0]
                 logger.debug(f"Sending tokens {i}, {next_token=}")
                 dist.send(next_token, dst=0, tag=i)
@@ -198,12 +198,12 @@ def decode_one_token(model: Transformer, batched_cur_token: torch.Tensor, input_
     logger.debug(f"Decoded next token {next_token.squeeze().tolist()}")
     return next_token
 
-
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, micro_batch_size: int, input_pos: torch.Tensor, num_new_tokens: int, logger: "loguru.Logger", **sampling_kwargs):
     """Decode n tokens"""
     # cur_token: [B, 1]
+    logger.debug(f"Calling decode_n_tokens")
 
-    # Setup shapes, dtypes, devicec
+    # Setup shapes, dtypes, device
     batch_size = cur_token.shape[0]
     num_micro_batches = batch_size // micro_batch_size
     tokens_shape = (micro_batch_size, 1)
@@ -222,75 +222,121 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, micro_batch_siz
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    def setup_mask(input_pos):
+    def setup_mask(model):
+        print(f"{rank} hello")
         assert input_pos.shape[-1] == 1
+        print(f"{rank} {input_pos=}")
+        print(f"{rank} {block_mask.BLOCK_SIZE[0]=}")
+        print(f"{rank} {input_pos // block_mask.BLOCK_SIZE[0]=}")
         block_index = input_pos // block_mask.BLOCK_SIZE[0]
         mask = block_mask[:, :, block_index]
         mask.mask_mod = block_mask.mask_mod
         mask.seq_lengths = (1, model.max_seq_length)
+        print(f"{rank} creation successful for {input_pos=}")
         return mask
 
+    batched_cur_token = list(torch.split(cur_token, micro_batch_size, dim=0))
     new_tokens = []
     if world_size == 1: # single node
         for _ in range(num_new_tokens):
-            batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
-            mask = setup_mask(input_pos)
-            next_tokens = []
+            mask = setup_mask(model)
+            batched_next_tokens = []
             for i, cur_token in enumerate(batched_cur_token):
-                logits = model(i, mask, cur_token, input_pos)
-                next_tokens.append(sample(logits, **sampling_kwargs)[0])
-            next_tokens = torch.cat(next_tokens, dim=0)
+                logits = model(i, mask, cur_token, input_pos, logger)
+                next_token = sample(logits, **sampling_kwargs)[0]
+                batched_cur_token[i] = next_token.clone()
+                batched_next_tokens.append(next_token.clone())
             input_pos += 1
-            new_tokens.append(next_tokens.clone())
-            cur_token = next_tokens.clone()
-
+            new_tokens.append(torch.cat(batched_next_tokens, dim=0))
     else: # multi-node
-        # allocate buffers
-        send_reqs = [None] * num_micro_batches     # Store send requests
-        recv_buffers = [None] * num_micro_batches  # Store tensors being received
-        recv_reqs = [None] * num_micro_batches     # Store receive requests
-
         if rank == 0: # first stage
-            for _ in range(num_new_tokens): # decoding steps
-                batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
-                mask = setup_mask(input_pos)
-                batched_next_tokens = []
-                for i, cur_token in enumerate(batched_cur_token):
-                    hidden_states = model(i, mask, cur_token, input_pos)
-                    logger.debug(f"Sending hidden states {i}, {hidden_states=}")
-                    dist.send(hidden_states, dst=1, tag=i)
-                    logger.debug(f"Sent hidden states {i}, {hidden_states=}")
-                    next_tokens = torch.empty(tokens_shape, dtype=tokens_dtype, device=device)
-                    logger.debug(f"Receiving tokens {i}, {next_tokens=}")
-                    dist.recv(next_tokens, src=1, tag=i)
-                    logger.debug(f"Got tokens {next_tokens=}")
-                    batched_next_tokens.append(next_tokens)
-                next_tokens = torch.cat(batched_next_tokens, dim=0)
-                cur_token = next_tokens.clone()
-                input_pos += 1
-                new_tokens.append(next_tokens.clone())
+            send_reqs = [None] * num_micro_batches     # Store send requests
+            recv_buffers = [None] * num_micro_batches  # Store tensors being received
+            recv_reqs = [None] * num_micro_batches     # Store receive requests
+            # Initial forwards for all micro-batches to start the pipeline
+            if num_new_tokens > 0:
+                mask = setup_mask(model)
+                for i in range(num_micro_batches):
+                    hidden_states = model(i, mask, batched_cur_token[i], input_pos, logger)
+                    logger.debug(f"Async send {i}{hidden_states=}")
+                    send_reqs[i] = dist.isend(hidden_states, dst=1, tag=i)
+                
+                    recv_buffers[i] = torch.empty(tokens_shape, dtype=tokens_dtype, device=device)
+                    logger.debug(f"Initialized {recv_buffers[i]=}")
+                    recv_reqs[i] = dist.irecv(recv_buffers[i], src=1, tag=i)
 
-        elif rank == world_size - 1: # last stage
-            for _ in range(num_new_tokens): # decoding steps
-                batched_cur_token = torch.split(cur_token, micro_batch_size, dim=0)
-                mask = setup_mask(input_pos)
+            for token_idx in range(num_new_tokens): # decoding steps
+                mask = setup_mask(model)
+                # Wait for oldest results and update
                 batched_next_tokens = []
-                for i, cur_token in enumerate(batched_cur_token):
-                    hidden_states = torch.empty(hidden_states_shape, dtype=hidden_states_dtype, device=device)
-                    logger.debug(f"Receiving hidden states {i}, {hidden_states=}")
-                    dist.recv(hidden_states, src=0, tag=i)
-                    logger.debug(f"Got hidden states {i}, {hidden_states=}")
-                    logits = model(i, mask, hidden_states, input_pos)
-                    next_tokens = sample(logits, **sampling_kwargs)[0]
-                    logger.debug(f"Sending tokens {i}, {next_tokens=}")
-                    dist.send(next_tokens, dst=0, tag=i)
-                    logger.debug(f"Sent tokens {i}, {next_tokens=}")
-                    batched_next_tokens.append(next_tokens)
-                next_tokens = torch.cat(batched_next_tokens, dim=0)
-                cur_token = next_tokens.clone()
+                for i in range(num_micro_batches):
+                    logger.debug(f"Loop for token {token_idx}")
+                    logger.debug(f"Wait for tokens {i}")
+                    recv_reqs[i].wait()
+                    logger.debug(f"Got {recv_buffers[i]=}")
+                    batched_cur_token[i] = recv_buffers[i].clone()
+                    batched_next_tokens.append(recv_buffers[i].clone())
+
+                    # Immediately process and send next token, except on last iteration
+                    if token_idx < num_new_tokens - 1:
+                        hidden_states = model(i, mask, batched_cur_token[i], input_pos, logger)
+                        logger.debug(f"Async send {i}{hidden_states=}")
+                        send_reqs[i] = dist.isend(hidden_states, dst=1, tag=i)
+                        
+                        recv_buffers[i] = torch.empty(tokens_shape, dtype=tokens_dtype, device=device)
+                        logger.debug(f"Initialized {recv_buffers[i]=}")
+                        recv_reqs[i] = dist.irecv(recv_buffers[i], src=1, tag=i)
+
+                # Ensure sends complete before next iteration
+                for i, req in enumerate(send_reqs):
+                    if not req.is_completed():
+                        logger.debug(f"Waiting for send of {i}")
+                        req.wait()
                 input_pos += 1
-                new_tokens.append(next_tokens.clone())
-        else:
+                new_tokens.append(torch.cat(batched_next_tokens, dim=0))
+        elif rank == world_size - 1: # last stage
+            send_reqs = [None] * num_micro_batches     # Store send requests
+            recv_buffers = [None] * num_micro_batches  # Store tensors being received
+            recv_reqs = [None] * num_micro_batches     # Store receive requests
+            # Initialize receives for all micro-batches
+            if num_new_tokens > 0:
+                for i in range(num_micro_batches):
+                    recv_buffers[i] = torch.empty(hidden_states_shape, dtype=hidden_states_dtype, device=device)
+                    logger.debug(f"Initialized {recv_buffers[i]=}")
+                    recv_reqs[i] = dist.irecv(recv_buffers[i], src=0, tag=i)
+            
+            for token_idx in range(num_new_tokens): # decoding steps
+                logger.debug(f"Loop for token {token_idx}")
+                batched_next_tokens = []
+                for i in range(num_micro_batches):
+                    logger.debug(f"Wait for recv {i}")
+                    recv_reqs[i].wait()
+                    logger.debug(f"Async recv {i} {recv_buffers[i]=}")
+
+                    mask = setup_mask(model)
+                    logger.debug(f"Getting logits")
+                    logits = model(i, mask, recv_buffers[i], input_pos, logger)
+                    logger.debug(f"Computed logits {i} {logits=}")
+                    next_token = sample(logits, **sampling_kwargs)[0]
+                    logger.debug(f"Sending {i} {next_token=}")
+                    send_reqs[i] = dist.isend(next_token, dst=0, tag=i)
+                    batched_cur_token[i] = next_token
+                    batched_next_tokens.append(next_token)
+
+                    # Immediately post next receive, except on last iteration
+                    if token_idx < num_new_tokens - 1:
+                        recv_buffers[i] = torch.empty(hidden_states_shape, dtype=hidden_states_dtype, device=device)
+                        recv_reqs[i] = dist.irecv(recv_buffers[i], src=0, tag=i)
+
+                # Ensure sends complete before next iteration
+                for i, req in enumerate(send_reqs):
+                    if not req.is_completed():
+                        logger.debug(f"Waiting for send of {i}")
+                        req.wait()
+
+                input_pos += 1
+                new_tokens.append(torch.cat(batched_next_tokens, dim=0))
+        else: # intermediate stages
             raise NotImplementedError
 
     return new_tokens
@@ -334,6 +380,7 @@ def generate(
     # Decode remaining tokens
     seq[:, num_prompt_tokens] = next_token.squeeze()
     input_pos = torch.tensor([num_prompt_tokens], device=device, dtype=torch.int)
+    print(f"{dist.get_rank()} {input_pos=}")
     generated_tokens = decode_n_tokens(model=model, cur_token=next_token.view(batch_size, -1), micro_batch_size=micro_batch_size, input_pos=input_pos, num_new_tokens=max_new_tokens - 1, logger=logger, **sampling_kwargs)
     seq[:, num_prompt_tokens+1:] = torch.cat(generated_tokens, dim=-1)
 

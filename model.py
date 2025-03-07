@@ -151,7 +151,8 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
 
     def forward(self, micro_batch_idx: int, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None, logger = None) -> Tensor:
-        # time.sleep(1)
+        if logger is not None:
+            logger.debug(f"Forward called {micro_batch_idx=}, {idx=}, {input_pos=}")
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
