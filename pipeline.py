@@ -167,6 +167,131 @@ def pipeline3(model, batched_tokens, rank, world_size, num_new_tokens):
     
     return batched_tokens
 
+def pipeline4(model, batched_tokens, rank, world_size, num_new_tokens):
+    """Asynchronously only on rank 0"""
+    tokens_shape = (batched_tokens[0].size(0), 1)
+    hidden_states_shape = (batched_tokens[0].size(0), 1, 4096)
+    dtype = batched_tokens[0].dtype # torch.long
+    device = batched_tokens[0].device # cpu
+    print(f"[{rank}] {tokens_shape=}, {hidden_states_shape=}, {dtype=}, {device=}")
+    num_micro_batches = len(batched_tokens)
+    
+    if rank == 0: # first stage
+        # Single set of buffers we'll reuse
+        send_reqs = [None] * num_micro_batches     # Store send requests
+        recv_buffers = [None] * num_micro_batches  # Store tensors being received
+        recv_reqs = [None] * num_micro_batches     # Store receive requests
+        
+        # Initial forwards for all micro-batches to start the pipeline
+        if num_new_tokens > 0:
+            for i in range(num_micro_batches):
+                hidden_states = model(batched_tokens[i], i)
+                send_reqs[i] = dist.isend(hidden_states, dst=1, tag=i)
+            
+                recv_buffers[i] = torch.empty(tokens_shape, dtype=dtype, device=device)
+                recv_reqs[i] = dist.irecv(recv_buffers[i], src=1, tag=i)
+        
+        # Process remaining tokens while keeping pipeline full
+        for token_idx in range(num_new_tokens):
+            # Wait for oldest results and update
+            for i in range(num_micro_batches):
+                recv_reqs[i].wait()
+                batched_tokens[i] = torch.cat((batched_tokens[i], recv_buffers[i]), dim=1)
+                
+                # Immediately process and send next token, except on last iteration
+                if token_idx < num_new_tokens - 1:
+                    hidden_states = model(batched_tokens[i], i)
+                    send_reqs[i] = dist.isend(hidden_states, dst=1, tag=i)
+                    
+                    recv_buffers[i] = torch.empty(tokens_shape, dtype=dtype, device=device)
+                    recv_reqs[i] = dist.irecv(recv_buffers[i], src=1, tag=i)
+            
+            # Ensure sends complete before next iteration
+            for req in send_reqs:
+                if not req.is_completed():
+                    req.wait()
+    
+    elif rank == world_size - 1: # last stage
+        recv_buffers = [None] * num_micro_batches
+        send_reqs = [None] * num_micro_batches
+        
+        # Process tokens while keeping pipeline full
+        for token_idx in range(num_new_tokens):
+            for i in range(num_micro_batches):
+                # Wait for input
+                recv_buffers[i] = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+                dist.recv(recv_buffers[i], src=0, tag=i)
+                
+                # Process and send back
+                next_tokens = model(recv_buffers[i], i)
+                send_reqs[i] = dist.isend(next_tokens, dst=0, tag=i)
+                batched_tokens[i] = torch.cat((batched_tokens[i], next_tokens), dim=1)
+                
+            # Ensure sends complete before next iteration
+            for req in send_reqs:
+                if not req.is_completed():
+                    req.wait()
+    
+    else:
+        raise NotImplementedError
+    
+    return batched_tokens
+
+def pipeline5(model, batched_tokens, rank, world_size, num_new_tokens):
+    """Sync but interleaved only on rank 0"""
+    tokens_shape = (batched_tokens[0].size(0), 1)
+    hidden_states_shape = (batched_tokens[0].size(0), 1, 4096)
+    dtype = batched_tokens[0].dtype # torch.long
+    device = batched_tokens[0].device # cpu
+    print(f"[{rank}] {tokens_shape=}, {hidden_states_shape=}, {dtype=}, {device=}")
+    num_micro_batches = len(batched_tokens)
+    
+    if rank == 0: # first stage
+        # Initial forwards for all micro-batches to start the pipeline
+        recv_reqs = [None] * num_micro_batches
+        recv_buffers = [None] * num_micro_batches
+        if num_new_tokens > 0:
+            for i in range(num_micro_batches):
+                hidden_states = model(batched_tokens[i], i)
+                dist.send(hidden_states, dst=1, tag=i)
+
+                recv_buffers[i] = torch.empty(tokens_shape, dtype=dtype, device=device)
+                recv_reqs[i] = dist.irecv(recv_buffers[i], src=1, tag=i)
+        
+        # Process remaining tokens while keeping pipeline full
+        for token_idx in range(num_new_tokens):
+            # Wait for oldest results and update
+            for i in range(num_micro_batches):
+                print(f"[{rank}] Waiting for token micro-batch {i}")
+                recv_reqs[i].wait()
+                batched_tokens[i] = torch.cat((batched_tokens[i], recv_buffers[i]), dim=1)
+                
+                # Immediately process and send next token, except on last iteration
+                if token_idx < num_new_tokens - 1:
+                    hidden_states = model(batched_tokens[i], i)
+                    dist.send(hidden_states, dst=1, tag=i)
+
+                    recv_buffers[i] = torch.empty(tokens_shape, dtype=dtype, device=device)
+                    recv_reqs[i] = dist.irecv(recv_buffers[i], src=1, tag=i)
+    
+    elif rank == world_size - 1: # last stage
+        # Process tokens while keeping pipeline full
+        for token_idx in range(num_new_tokens):
+            for i in range(num_micro_batches):
+                # Wait for input
+                hidden_states = torch.empty(hidden_states_shape, dtype=dtype, device=device)
+                print(f"[{rank}] Waiting for hidden state micro-batch {i}")
+                dist.recv(hidden_states, src=0, tag=i)
+                next_tokens = model(hidden_states, i)
+                print(f"[{rank}] Sending token micro-batch {i}")
+                dist.send(next_tokens, dst=0, tag=i)
+                batched_tokens[i] = torch.cat((batched_tokens[i], next_tokens), dim=1)
+    
+    else:
+        raise NotImplementedError
+    
+    return batched_tokens
+
 def main(rank: int, world_size: int):
     print(f"[{rank}] Running")
     dist.init_process_group(backend="gloo", init_method="tcp://localhost:12345", rank=rank, world_size=world_size)
@@ -187,7 +312,7 @@ def main(rank: int, world_size: int):
     # Run pipelined decoding
     num_new_tokens = 5
     start_time = time.time()
-    batched_tokens = pipeline3(model, micro_batches, rank, world_size, num_new_tokens)
+    batched_tokens = pipeline5(model, micro_batches, rank, world_size, num_new_tokens)
     print(f"[{rank}] Time taken: {time.time() - start_time} seconds")
     print(torch.cat(batched_tokens, dim=0))
 

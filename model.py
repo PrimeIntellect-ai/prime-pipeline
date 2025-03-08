@@ -4,7 +4,6 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
-import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,8 +12,8 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
     BlockMask,
+    _mask_mod_signature,
     flex_attention,
 )
 
@@ -60,47 +59,143 @@ class ModelArgs:
         if name in transformer_configs:
             return cls(**transformer_configs[name])
         # fuzzy search
-        config = [config for config in transformer_configs if config.lower() in str(name).lower()]
+        config = [
+            config
+            for config in transformer_configs
+            if config.lower() in str(name).lower()
+        ]
 
         # We may have two or more configs matched (e.g. "7B" and "Mistral-7B"). Find the best config match,
         # take longer name (as it have more symbols matched)
         if len(config) > 1:
             config.sort(key=len, reverse=True)
-            assert len(config[0]) != len(config[1]), name # make sure only one 'best' match
-            
+            assert len(config[0]) != len(config[1]), (
+                name
+            )  # make sure only one 'best' match
+
         return cls(**transformer_configs[config[0]])
 
 
 transformer_configs = {
-    "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
+    "CodeLlama-7b-Python-hf": dict(
+        block_size=16384, vocab_size=32000, n_layer=32, dim=4096, rope_base=1000000
+    ),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
     "30B": dict(n_layer=60, n_head=52, dim=6656),
-    "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
-    "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
-    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
+    "34B": dict(
+        n_layer=48,
+        n_head=64,
+        dim=8192,
+        vocab_size=32000,
+        n_local_heads=8,
+        intermediate_size=22016,
+        rope_base=1000000,
+    ),  # CodeLlama-34B-Python-hf
+    "70B": dict(
+        n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672
+    ),
+    "Mistral-7B": dict(
+        n_layer=32,
+        n_head=32,
+        n_local_heads=8,
+        dim=4096,
+        intermediate_size=14336,
+        vocab_size=32000,
+    ),
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
-
-    "llama-3-8b": dict(block_size=8192, n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=128256, rope_base=500000),
-    "llama-3-70b": dict(block_size=8192, n_layer=80, n_head=64, n_local_heads=8, dim=8192, intermediate_size=28672, vocab_size=128256, rope_base=500000),
-    "llama-3.1-8b": dict(block_size=131072, n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=128256, rope_base=500000,
-        rope_scaling=dict(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
+    "llama-3-8b": dict(
+        block_size=8192,
+        n_layer=32,
+        n_head=32,
+        n_local_heads=8,
+        dim=4096,
+        intermediate_size=14336,
+        vocab_size=128256,
+        rope_base=500000,
     ),
-    "llama-3.1-70b": dict(block_size=131072, n_layer=80, n_head=64, n_local_heads=8, dim=8192, intermediate_size=28672, vocab_size=128256, rope_base=500000,
-        rope_scaling=dict(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
+    "llama-3-70b": dict(
+        block_size=8192,
+        n_layer=80,
+        n_head=64,
+        n_local_heads=8,
+        dim=8192,
+        intermediate_size=28672,
+        vocab_size=128256,
+        rope_base=500000,
     ),
-    "llama-3.1-405b": dict(block_size=131072, n_layer=126, n_head=128, n_local_heads=8, dim=16384, intermediate_size=53248, vocab_size=128256, rope_base=500000,
-        rope_scaling=dict(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
+    "llama-3.1-8b": dict(
+        block_size=131072,
+        n_layer=32,
+        n_head=32,
+        n_local_heads=8,
+        dim=4096,
+        intermediate_size=14336,
+        vocab_size=128256,
+        rope_base=500000,
+        rope_scaling=dict(
+            factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=4.0,
+            original_max_position_embeddings=8192,
+        ),
+    ),
+    "llama-3.1-70b": dict(
+        block_size=131072,
+        n_layer=80,
+        n_head=64,
+        n_local_heads=8,
+        dim=8192,
+        intermediate_size=28672,
+        vocab_size=128256,
+        rope_base=500000,
+        rope_scaling=dict(
+            factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=4.0,
+            original_max_position_embeddings=8192,
+        ),
+    ),
+    "llama-3.1-405b": dict(
+        block_size=131072,
+        n_layer=126,
+        n_head=128,
+        n_local_heads=8,
+        dim=16384,
+        intermediate_size=53248,
+        vocab_size=128256,
+        rope_base=500000,
+        rope_scaling=dict(
+            factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=4.0,
+            original_max_position_embeddings=8192,
+        ),
     ),
 }
 
+
 class KVCache(nn.Module):
-    def __init__(self, num_micro_batches, max_micro_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        num_micro_batches,
+        max_micro_batch_size,
+        max_seq_length,
+        n_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+    ):
         super().__init__()
-        cache_shape = (num_micro_batches, max_micro_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        cache_shape = (
+            num_micro_batches,
+            max_micro_batch_size,
+            n_heads,
+            max_seq_length,
+            head_dim,
+        )
+        self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
         cache_bytes = 2 * self.k_cache.numel() * 2
 
     def update(self, micro_batch_idx, input_pos, k_val, v_val):
@@ -122,7 +217,9 @@ class Transformer(nn.Module):
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(
+            TransformerBlock(config) for _ in range(config.n_layer)
+        )
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -133,7 +230,10 @@ class Transformer(nn.Module):
         self.get_mask_mod = get_mask_mod
 
     def setup_caches(self, num_micro_batches, max_micro_batch_size, max_seq_length):
-        if self.max_seq_length >= max_seq_length and self.max_batch_size >= num_micro_batches * max_micro_batch_size:
+        if (
+            self.max_seq_length >= max_seq_length
+            and self.max_batch_size >= num_micro_batches * max_micro_batch_size
+        ):
             return
         head_dim = self.config.dim // self.config.n_head
         max_seq_length = find_multiple(max_seq_length, 8)
@@ -146,19 +246,43 @@ class Transformer(nn.Module):
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
         for b in self.layers:
-            b.attention.kv_cache = KVCache(num_micro_batches, max_micro_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+            b.attention.kv_cache = KVCache(
+                num_micro_batches,
+                max_micro_batch_size,
+                max_seq_length,
+                self.config.n_local_heads,
+                head_dim,
+                dtype,
+            )
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.block_size,
+            self.config.dim // self.config.n_head,
+            self.config.rope_base,
+            dtype,
+            self.config.rope_scaling,
+        )
 
-    def forward(self, micro_batch_idx: int, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None, logger = None) -> Tensor:
-        if logger is not None:
-            logger.debug(f"Forward called {micro_batch_idx=}, {idx=}, {input_pos=}")
+    def forward(
+        self,
+        micro_batch_idx: int,
+        mask: BlockMask,
+        input_ids: Tensor,
+        input_pos: Optional[Tensor],
+        hidden_states: Optional[Tensor] = None,
+    ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
-        x = self.tok_embeddings(idx)
 
-        for i, layer in enumerate(self.layers):
+        assert hidden_states is not None or input_ids is not None, (
+            "Must provide either hidden states or input ids"
+        )
+        x = hidden_states if hidden_states is not None else input_ids
+
+        x = self.tok_embeddings(x)
+
+        for layer in self.layers:
             x = layer(micro_batch_idx, x, input_pos, freqs_cis, mask)
         x = self.norm(x)
         logits = self.output(x)
@@ -177,8 +301,17 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, micro_batch_idx: int, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
-        h = x + self.attention(micro_batch_idx, self.attention_norm(x), freqs_cis, mask, input_pos)
+    def forward(
+        self,
+        micro_batch_idx: int,
+        x: Tensor,
+        input_pos: Tensor,
+        freqs_cis: Tensor,
+        mask: BlockMask,
+    ) -> Tensor:
+        h = x + self.attention(
+            micro_batch_idx, self.attention_norm(x), freqs_cis, mask, input_pos
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -207,7 +340,14 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, micro_batch_idx: int, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        micro_batch_idx: int,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: BlockMask,
+        input_pos: Optional[Tensor] = None,
+    ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -225,7 +365,9 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(micro_batch_idx, input_pos, k, v)
 
-        y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        y = flex_attention(
+            q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads)
+        )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -275,17 +417,23 @@ def apply_rope_scaling(freqs: torch.Tensor, rope_scaling: Optional[dict] = None)
             new_freqs.append(freq / factor)
         else:
             assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
             new_freqs.append((1 - smooth) * freq / factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
 
 def precompute_freqs_cis(
-    seq_len: int, n_elem: int, base: int = 10000,
+    seq_len: int,
+    n_elem: int,
+    base: int = 10000,
     dtype: torch.dtype = torch.bfloat16,
     rope_scaling: Optional[dict] = None,
 ) -> Tensor:
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+    freqs = 1.0 / (
+        base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
+    )
     if rope_scaling is not None:
         freqs = apply_rope_scaling(freqs, rope_scaling)
     t = torch.arange(seq_len, device=freqs.device)
@@ -309,6 +457,7 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
 
+
 class TransformerShard(Transformer):
     def __init__(self, rank: int, world_size: int, model: Transformer) -> None:
         # Save parameters
@@ -317,8 +466,12 @@ class TransformerShard(Transformer):
         self.__dict__.update(model.__dict__)
 
         # Setup sharded model
-        layer_indices = TransformerShard.distribute_layers(stage=rank, num_stages=world_size, num_layers=model.config.n_layer)
-        self.tok_embeddings = model.tok_embeddings if self.is_first_stage else nn.Identity()
+        layer_indices = TransformerShard.distribute_layers(
+            stage=rank, num_stages=world_size, num_layers=model.config.n_layer
+        )
+        self.tok_embeddings = (
+            model.tok_embeddings if self.is_first_stage else nn.Identity()
+        )
         self.layers = nn.ModuleList([model.layers[i] for i in layer_indices])
         self.norm = model.norm if self.is_last_stage else nn.Identity()
         self.output = model.output if self.is_last_stage else nn.Identity()
@@ -335,12 +488,13 @@ class TransformerShard(Transformer):
 
     @staticmethod
     def distribute_layers(stage: int, num_stages: int, num_layers: int) -> list[int]:
-        layers_per_gpu = [num_layers // num_stages + (1 if i < num_layers % num_stages else 0) for i in range(num_stages)]
+        layers_per_gpu = [
+            num_layers // num_stages + (1 if i < num_layers % num_stages else 0)
+            for i in range(num_stages)
+        ]
         start_layer = sum(layers_per_gpu[:stage])
         return list(range(start_layer, start_layer + layers_per_gpu[stage]))
 
-def shard_model(model: Transformer, rank: int, world_size: int) -> TransformerShard:
-    return TransformerShard(rank=rank, world_size=world_size, model=model)
 
 if __name__ == "__main__":
     print("Running model.py")
@@ -349,14 +503,31 @@ if __name__ == "__main__":
     dtype = torch.float16
 
     world_size = 2
+
     def get_shard(rank: int) -> TransformerShard:
         print(f"Getting shard for rank {rank}")
-        return TransformerShard(rank=rank, world_size=world_size, model=load_model(checkpoint_path=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), device=device, precision=dtype))
+        return TransformerShard(
+            rank=rank,
+            world_size=world_size,
+            model=load_model(
+                checkpoint_path=Path(
+                    "checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"
+                ),
+                device=device,
+                precision=dtype,
+            ),
+        )
 
     # Load full model and model shards
-    from utils import load_model
     from pathlib import Path
-    model = load_model(checkpoint_path=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), device=device, precision=dtype)
+
+    from utils import load_model
+
+    model = load_model(
+        checkpoint_path=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"),
+        device=device,
+        precision=dtype,
+    )
     model1 = get_shard(rank=0)
     model2 = get_shard(rank=1)
 
@@ -366,9 +537,19 @@ if __name__ == "__main__":
     micro_batch_size = batch_size // num_micro_batches
 
     seq_length = 32  # Or any reasonable sequence length for testing
-    model.setup_caches(num_micro_batches=1, max_micro_batch_size=batch_size, max_seq_length=seq_length)
-    model1.setup_caches(num_micro_batches=num_micro_batches, max_micro_batch_size=micro_batch_size, max_seq_length=seq_length)
-    model2.setup_caches(num_micro_batches=num_micro_batches, max_micro_batch_size=micro_batch_size, max_seq_length=seq_length)
+    model.setup_caches(
+        num_micro_batches=1, max_micro_batch_size=batch_size, max_seq_length=seq_length
+    )
+    model1.setup_caches(
+        num_micro_batches=num_micro_batches,
+        max_micro_batch_size=micro_batch_size,
+        max_seq_length=seq_length,
+    )
+    model2.setup_caches(
+        num_micro_batches=num_micro_batches,
+        max_micro_batch_size=micro_batch_size,
+        max_seq_length=seq_length,
+    )
 
     # Test tokens
     test_tokens = torch.randint(0, model1.config.vocab_size, (batch_size, 4))
@@ -379,7 +560,9 @@ if __name__ == "__main__":
     def causal_mask(b, h, q, kv):
         return q >= kv
 
-    mask = create_block_mask(causal_mask, 1, 1, input_pos.shape[0], model1.max_seq_length, device=device)
+    mask = create_block_mask(
+        causal_mask, 1, 1, input_pos.shape[0], model1.max_seq_length, device=device
+    )
 
     out = model(0, mask, test_tokens, input_pos)
 
@@ -392,4 +575,6 @@ if __name__ == "__main__":
 
     shards_out = torch.cat(shards_out, dim=0)
 
-    import code; code.interact(local=dict(globals(), **locals()))
+    import code
+
+    code.interact(local=dict(globals(), **locals()))

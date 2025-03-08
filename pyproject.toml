@@ -20,4 +20,5 @@ dependencies = [
 dev = [
     "ipykernel>=6.29.5",
     "lovely-tensors>=0.1.18",
+    "ruff>=0.9.10",
 ]
