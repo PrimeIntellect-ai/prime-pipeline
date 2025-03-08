@@ -266,8 +266,8 @@ class Transformer(nn.Module):
         self,
         micro_batch_idx: int,
         mask: BlockMask,
-        input_ids: Tensor,
-        input_pos: Optional[Tensor],
+        input_pos: Tensor,
+        input_ids: Optional[Tensor],
         hidden_states: Optional[Tensor] = None,
     ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
