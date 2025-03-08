@@ -196,7 +196,6 @@ class KVCache(nn.Module):
         )
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
-        cache_bytes = 2 * self.k_cache.numel() * 2
 
     def update(self, micro_batch_idx, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]

@@ -1,4 +1,5 @@
 # From: https://github.com/pytorch-labs/gpt-fast/blob/main/generate.py
+import argparse
 import sys
 import time
 from functools import partial
@@ -18,9 +19,9 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 # Local imports
 from model import Transformer
 from tokenizer import get_tokenizer
-from utils import load_model, seed_everything, shard_model
+from utils import get_device, get_precision, load_model, seed_everything, shard_model
 
-# Use lovely tensors (DEBUG)
+# Use lovely tensors
 monkey_patch()
 
 # Setup compile flags
@@ -105,9 +106,9 @@ def maybe_recv_fwd(
 
     # Receive tensor
     recv = dist.irecv if do_async else dist.recv
-    # logger.debug(
-    #     f"Scheduled recv_fwd {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
-    # )
+    logger.debug(
+        f"Scheduled recv_fwd {tag=} {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
+    )
     recv_req = recv(recv_tensor, src=dist.get_rank() - 1, tag=tag)
 
     return recv_tensor, WaitIfNecessary(recv_req)
@@ -116,7 +117,7 @@ def maybe_recv_fwd(
 def maybe_send_fwd(tensor: Tensor, tag: int) -> None:
     if dist.get_world_size() == 1 or dist.get_rank() == dist.get_world_size() - 1:
         return
-    # logger.debug(f"Call send_fwd {tensor=} {tag=}")
+    logger.debug(f"Call send_fwd {tensor=} {tag=}")
     dist.send(tensor, dst=dist.get_rank() + 1, tag=tag)
 
 
@@ -131,9 +132,9 @@ def maybe_recv_bwd(
         return None, None
     recv_tensor = torch.empty(size=shape, dtype=dtype, device=device)
     recv = dist.irecv if do_async else dist.recv
-    # logger.debug(
-    #     f"Scheduled recv_bwd {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
-    # )
+    logger.debug(
+        f"Scheduled recv_bwd {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
+    )
     recv_req = recv(recv_tensor, src=dist.get_world_size() - 1, tag=tag)
     return recv_tensor, WaitIfNecessary(recv_req)
 
@@ -141,7 +142,7 @@ def maybe_recv_bwd(
 def maybe_send_bwd(tensor: Tensor, tag: int) -> None:
     if dist.get_world_size() == 1 or dist.get_rank() != dist.get_world_size() - 1:
         return
-    # logger.debug(f"Call send_bwd {tensor=} {tag=}")
+    logger.debug(f"Call send_bwd {tensor=} {tag=}")
     dist.send(tensor, dst=0, tag=tag)
 
 
@@ -220,7 +221,9 @@ def prefill(
     tokens_shape = (micro_batch_size, 1)
     tokens_dtype = torch.long  # TODO: dont hardcode
     hidden_states_shape = (micro_batch_size, batched_prompt_tokens[0].size(1), 4096)
-    hidden_states_dtype = torch.float16  # TODO: dont hardcode
+    hidden_states_dtype = model.layers[
+        0
+    ].feed_forward.w1.weight.dtype  # TODO: Cleaner way
     device = batched_prompt_tokens[0].device
 
     # Partially apply recv functions
@@ -252,7 +255,6 @@ def prefill(
     batched_next_tokens: List[Tensor] = []  # List[Tensor[micro_batch_size, 1]]
     for micro_batch_idx, prompt_tokens in enumerate(batched_prompt_tokens):
         hidden_states, _ = rank_maybe_recv_fwd(tag=micro_batch_idx)
-        t0 = time.time()
         outputs = model_forward(
             model,
             micro_batch_idx,
@@ -261,7 +263,6 @@ def prefill(
             input_pos,
             hidden_states,
         )
-        logger.debug(f"Forward time: {time.time() - t0:.2f} seconds")
         maybe_send_fwd(outputs, tag=micro_batch_idx)
         next_token = maybe_sample(outputs, **sampling_kwargs)
         if next_token is None:
@@ -306,11 +307,10 @@ def decode_n_tokens(
     tokens_shape = (micro_batch_size, 1)
     tokens_dtype = torch.long  # TODO: dont hardcode
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    hidden_states_dtype = torch.float16  # TODO: dont hardcode
+    hidden_states_dtype = model.layers[
+        0
+    ].feed_forward.w1.weight.dtype  # TODO: Cleaner way
     device = batched_cur_tokens[0].device
-    logger.debug(f"{tokens_shape=}, {tokens_dtype=}")
-    logger.debug(f"{hidden_states_shape=}, {hidden_states_dtype=}")
-    logger.debug(f"{device=}")
 
     # Setup receive and send functions
     recv_func = maybe_recv_bwd if dist.get_rank() == 0 else maybe_recv_fwd
@@ -347,7 +347,6 @@ def decode_n_tokens(
     # Prefill pipeline on first stage
     if dist.get_rank() == 0 and dist.get_world_size() > 1:
         for micro_batch_idx in range(num_micro_batches):
-            t0 = time.time()
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
             hidden_states = model_forward(
                 model,
@@ -356,7 +355,6 @@ def decode_n_tokens(
                 batched_cur_tokens[micro_batch_idx],
                 input_pos,
             )
-            logger.debug(f"Forward time: {time.time() - t0:.2f} seconds")
             send(hidden_states, tag=micro_batch_idx)
             recv_tensor, recv_req = recv(tag=micro_batch_idx)
             recv_reqs[micro_batch_idx] = recv_req
@@ -371,7 +369,6 @@ def decode_n_tokens(
         for micro_batch_idx in range(num_micro_batches):
             # Wait for requests
             if dist.get_world_size() == 1:
-                t0 = time.time()
                 logits = model_forward(
                     model,
                     micro_batch_idx,
@@ -379,7 +376,6 @@ def decode_n_tokens(
                     batched_cur_tokens[micro_batch_idx],
                     input_pos,
                 )
-                logger.debug(f"Forward time: {time.time() - t0:.2f} seconds")
                 next_token = sample(logits, **sampling_kwargs)
                 batched_next_tokens.append(next_token)
                 batched_cur_tokens[micro_batch_idx] = next_token
@@ -391,7 +387,6 @@ def decode_n_tokens(
                     batched_next_tokens.append(next_token)
 
                     if token_idx < num_new_tokens - 1:
-                        t0 = time.time()
                         hidden_states = model_forward(
                             model,
                             micro_batch_idx,
@@ -399,7 +394,6 @@ def decode_n_tokens(
                             batched_cur_tokens[micro_batch_idx],
                             input_pos,
                         )
-                        logger.debug(f"Forward time: {time.time() - t0:.2f} seconds")
                         send(hidden_states, tag=micro_batch_idx)
 
                         recv_tensor, recv_req = recv(tag=micro_batch_idx)
@@ -407,7 +401,6 @@ def decode_n_tokens(
                         recv_buffers[micro_batch_idx] = recv_tensor
                 elif dist.get_rank() == dist.get_world_size() - 1:
                     hidden_states, _ = recv(tag=micro_batch_idx)
-                    t0 = time.time()
                     logits = model_forward(
                         model,
                         micro_batch_idx,
@@ -416,7 +409,6 @@ def decode_n_tokens(
                         input_pos,
                         hidden_states,
                     )
-                    logger.debug(f"Forward time: {time.time() - t0:.2f} seconds")
                     next_token = maybe_sample(logits, **sampling_kwargs)
                     batched_cur_tokens[micro_batch_idx] = next_token
                     batched_next_tokens.append(next_token)
@@ -448,7 +440,9 @@ def generate(
     """
     # Setup sequence length and microbatching
     batch_size, num_prompt_tokens = prompt_tokens.shape
-    num_micro_batches = dist.get_world_size()
+    num_micro_batches = (
+        dist.get_world_size() if batch_size >= dist.get_world_size() else 1
+    )
     seq_length = min(num_prompt_tokens + max_new_tokens, model.config.block_size)
     micro_batch_size = batch_size // num_micro_batches
 
@@ -469,6 +463,10 @@ def generate(
     decoded_tokens = torch.empty(batch_size, seq_length, dtype=dtype, device=device)
     decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
 
+    # Return early if no new tokens are generated
+    if max_new_tokens == 0:
+        return decoded_tokens
+
     # Prefill prompt tokens
     next_token = prefill(
         model=model,
@@ -482,6 +480,9 @@ def generate(
     # Decode remaining tokens
     batched_cur_tokens = list(torch.split(next_token, micro_batch_size, dim=0))
     input_pos = torch.tensor([num_prompt_tokens], device=device, dtype=torch.long)
+    num_new_tokens = max_new_tokens - 1
+    if num_new_tokens == 0:
+        return decoded_tokens
     next_tokens = decode_n_tokens(
         model=model,
         batched_cur_tokens=batched_cur_tokens,
@@ -495,19 +496,7 @@ def generate(
     return decoded_tokens
 
 
-def main(
-    checkpoint_path: Path,
-    prompt: str = "Hello, my name is",
-    num_samples: int = 5,
-    max_new_tokens: int = 100,
-    batch_size: int = 1,
-    top_k: int = 200,
-    temperature: float = 0.8,
-    compile: bool = True,
-    precision: str = "bfloat16",
-    seed: int = 1234,
-    log_level: str = "INFO",  # console log level
-) -> None:
+def main(args: argparse.Namespace) -> None:
     # Setup process group
     dist.init_process_group()
 
@@ -515,19 +504,21 @@ def main(
     global logger
     console_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> [<level>{level}</level>] [<level>Rank {extra[rank]}</level>] - <level>{message}</level>"
     logger.remove()
-    logger.add(sys.stdout, level=log_level, format=console_format)
+    logger.add(sys.stdout, level=args.log_level, format=console_format)
     logger = logger.bind(rank=dist.get_rank())
     logger.info("Starting")
+    logger.info(f"Config: {vars(args)}")
 
     # Set seeds for reproducibility across all processes
-    seed_everything(seed)
+    seed_everything(args.seed)
 
     # Set device and precision
-    device = f"cuda:{dist.get_rank()}"
-    precision = torch.float16 if precision == "float16" else torch.bfloat16
+    device = get_device(args.device)
+    precision = get_precision(args.precision)
 
     # Load model
     t0 = time.time()
+    checkpoint_path = Path(f"checkpoints/{args.model_repo}/model.pth")
     model = load_model(checkpoint_path, device, precision)
     torch.cuda.synchronize(device)
     logger.info(f"Loaded model in {time.time() - t0:.02f} seconds")
@@ -543,7 +534,7 @@ def main(
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
-    if compile:
+    if args.compile:
         global create_block_mask
         create_block_mask = torch.compile(create_block_mask, fullgraph=True)
 
@@ -554,23 +545,23 @@ def main(
         model_forward = torch.compile(model_forward, fullgraph=True)
 
     # Encode prompt (batch_size, num_prompt_tokens)
-    prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
+    prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(args.prompt)
     prompt_tokens = torch.tensor(
         prompt_tokens,
         device=device,
-    ).repeat(batch_size, 1)
+    ).repeat(args.batch_size, 1)
 
-    start = -1 if compile else 0
+    start = -1 if args.compile else 0
     metrics = {"latency": [], "tps": []}
-    for i in range(start, num_samples):
+    for i in range(start, args.num_samples):
         torch.cuda.synchronize(device)
         start_time = time.perf_counter()
         decoded_tokens = generate(
             model=model,
             prompt_tokens=prompt_tokens,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
         )
         if i == -1:
             logger.info(
@@ -581,8 +572,8 @@ def main(
         # Calculate metrics
         torch.cuda.synchronize(device)
         time_taken = time.perf_counter() - start_time
-        num_prompt_tokens = batch_size * prompt_tokens.size(-1)
-        num_generated_tokens = batch_size * (
+        num_prompt_tokens = args.batch_size * prompt_tokens.size(-1)
+        num_generated_tokens = args.batch_size * (
             decoded_tokens.size(-1) - prompt_tokens.size(-1)
         )
         num_total_tokens = num_prompt_tokens + num_generated_tokens
@@ -590,15 +581,14 @@ def main(
         metrics["tps"].append(num_generated_tokens / time_taken)
 
         # Print generations (on main rank)
-        for i in range(batch_size):
-            if dist.get_rank() == 0:
-                logger.info(
-                    f"Sample {i + 1}: {tokenizer.decode(decoded_tokens[i].tolist())}"
-                )
+        if dist.get_rank() == 0:
+            logger.info(
+                f"First generation: {tokenizer.decode(decoded_tokens[0].tolist())}"
+            )
 
     # Print metrics (on main rank)
     if dist.get_rank() == 0:
-        logger.info(f"Batch Size: {batch_size}")
+        logger.info(f"Batch Size: {args.batch_size}")
         logger.info(f"Number of prompt tokens: {num_prompt_tokens}")
         logger.info(f"Number of generated tokens: {num_generated_tokens}")
         logger.info(f"Number of total tokens: {num_total_tokens}")
@@ -619,45 +609,43 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--checkpoint_path", type=Path, required=True, help="Model checkpoint path."
+        "--model_repo",
+        type=str,
+        default="meta-llama/Llama-2-7b-chat-hf",
+        help="Model repository.",
     )
     parser.add_argument(
         "--prompt", type=str, default="Hello, my name is", help="Input prompt."
     )
-    parser.add_argument("--num_samples", type=int, default=1, help="Number of samples.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
     parser.add_argument(
-        "--max_new_tokens", type=int, default=200, help="Maximum number of new tokens."
+        "--num_samples", type=int, default=1, help="Number of samples to generate."
+    )
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=50, help="Maximum number of new tokens."
     )
     parser.add_argument("--top_k", type=int, default=200, help="Top-k for sampling.")
     parser.add_argument(
         "--temperature", type=float, default=0.8, help="Temperature for sampling."
     )
     parser.add_argument(
-        "--compile", action="store_true", help="Whether to compile the model."
+        "--compile",
+        action="store_true",
+        default=False,
+        help="Whether to compile the model.",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda", help="Device to use for the model."
     )
     parser.add_argument(
         "--precision",
         type=str,
-        default="float16",
+        default="bfloat16",
         help="Precision to use for the model.",
     )
     parser.add_argument(
         "--seed", type=int, default=1234, help="Seed for reproducibility."
     )
-    parser.add_argument("--log_level", type=str, default="DEBUG", help="Log level.")
+    parser.add_argument("--log_level", type=str, default="INFO", help="Log level.")
 
-    args = parser.parse_args()
-    main(
-        prompt=args.prompt,
-        num_samples=args.num_samples,
-        max_new_tokens=args.max_new_tokens,
-        batch_size=args.batch_size,
-        top_k=args.top_k,
-        temperature=args.temperature,
-        checkpoint_path=args.checkpoint_path,
-        compile=args.compile,
-        precision=args.precision,
-        seed=args.seed,
-        log_level=args.log_level,
-    )
+    main(parser.parse_args())
