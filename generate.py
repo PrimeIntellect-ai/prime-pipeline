@@ -28,7 +28,6 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True
 torch._functorch.config.enable_autograd_cache = True
-# torch._dynamo.config.capture_scalar_outputs = True # fixes a new issue
 
 # Support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -80,24 +79,6 @@ def maybe_sample(logits: Tensor, **sampling_kwargs) -> Optional[Tensor]:
     if dist.get_rank() == dist.get_world_size() - 1:
         return sample(logits, **sampling_kwargs)
     return None
-
-
-def causal_mask(b, h, q, kv):
-    """Causal mask using for flex attention"""
-    return q >= kv
-
-
-def adjust_mask(
-    block_mask: BlockMask, input_pos: Tensor, max_seq_length: int
-) -> BlockMask:
-    """Adjust the mask for the given input position"""
-    assert input_pos.shape[-1] == 1
-    block_index = input_pos // block_mask.BLOCK_SIZE[0]
-    mask = block_mask[:, :, block_index]
-    mask.mask_mod = block_mask.mask_mod
-    mask.seq_lengths = (1, max_seq_length)
-
-    return mask
 
 
 class WaitIfNecessary:
@@ -164,6 +145,51 @@ def maybe_send_bwd(tensor: Tensor, tag: int) -> None:
     dist.send(tensor, dst=0, tag=tag)
 
 
+def causal_mask(b, h, q, kv):
+    """Causal mask using for flex attention"""
+    return q >= kv
+
+
+def adjust_mask(
+    block_mask: BlockMask, input_pos: Tensor, max_seq_length: int
+) -> BlockMask:
+    """Adjust the mask for the given input position"""
+    assert input_pos.shape[-1] == 1
+    block_index = input_pos // block_mask.BLOCK_SIZE[0]
+    mask = block_mask[:, :, block_index]
+    mask.mask_mod = block_mask.mask_mod
+    mask.seq_lengths = (1, max_seq_length)
+
+    return mask
+
+
+def model_forward(
+    model: Transformer,
+    micro_batch_idx: int,
+    block_mask: BlockMask,
+    prompt_tokens: Tensor,
+    input_pos: Tensor,
+    hidden_states: Optional[Tensor] = None,
+) -> Tensor:
+    """Wrapper of forward pass of the model for torch.compile"""
+    return model(micro_batch_idx, block_mask, prompt_tokens, input_pos, hidden_states)
+
+
+def adjust_mask_and_model_forward(
+    model: Transformer,
+    micro_batch_idx: int,
+    block_mask: BlockMask,
+    prompt_tokens: Tensor,
+    input_pos: Tensor,
+    hidden_states: Optional[Tensor] = None,
+) -> Tensor:
+    """Wrapper for adjust mask and forward pass of the model for torch.compile"""
+    mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+    return model_forward(
+        model, micro_batch_idx, mask, prompt_tokens, input_pos, hidden_states
+    )
+
+
 def prefill(
     model: Transformer,
     batched_prompt_tokens: List[Tensor],
@@ -227,7 +253,8 @@ def prefill(
     for micro_batch_idx, prompt_tokens in enumerate(batched_prompt_tokens):
         hidden_states, _ = rank_maybe_recv_fwd(tag=micro_batch_idx)
         t0 = time.time()
-        outputs = model(
+        outputs = model_forward(
+            model,
             micro_batch_idx,
             block_mask,
             prompt_tokens,
@@ -320,10 +347,14 @@ def decode_n_tokens(
     # Prefill pipeline on first stage
     if dist.get_rank() == 0 and dist.get_world_size() > 1:
         for micro_batch_idx in range(num_micro_batches):
-            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
             t0 = time.time()
-            hidden_states = model(
-                micro_batch_idx, mask, batched_cur_tokens[micro_batch_idx], input_pos
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+            hidden_states = model_forward(
+                model,
+                micro_batch_idx,
+                mask,
+                batched_cur_tokens[micro_batch_idx],
+                input_pos,
             )
             logger.debug(f"Forward time: {time.time() - t0:.2f} seconds")
             send(hidden_states, tag=micro_batch_idx)
@@ -341,7 +372,8 @@ def decode_n_tokens(
             # Wait for requests
             if dist.get_world_size() == 1:
                 t0 = time.time()
-                logits = model(
+                logits = model_forward(
+                    model,
                     micro_batch_idx,
                     mask,
                     batched_cur_tokens[micro_batch_idx],
@@ -360,7 +392,8 @@ def decode_n_tokens(
 
                     if token_idx < num_new_tokens - 1:
                         t0 = time.time()
-                        hidden_states = model(
+                        hidden_states = model_forward(
+                            model,
                             micro_batch_idx,
                             mask,
                             batched_cur_tokens[micro_batch_idx],
@@ -375,7 +408,8 @@ def decode_n_tokens(
                 elif dist.get_rank() == dist.get_world_size() - 1:
                     hidden_states, _ = recv(tag=micro_batch_idx)
                     t0 = time.time()
-                    logits = model(
+                    logits = model_forward(
+                        model,
                         micro_batch_idx,
                         mask,
                         batched_cur_tokens[micro_batch_idx],
@@ -483,17 +517,14 @@ def main(
     logger.remove()
     logger.add(sys.stdout, level=log_level, format=console_format)
     logger = logger.bind(rank=dist.get_rank())
-    logger.info("Starting...")
+    logger.info("Starting")
 
     # Set seeds for reproducibility across all processes
     seed_everything(seed)
-    logger.info(f"Seeded with {seed}")
 
     # Set device and precision
     device = f"cuda:{dist.get_rank()}"
     precision = torch.float16 if precision == "float16" else torch.bfloat16
-    logger.info(f"Using device {device}")
-    logger.info(f"Using precision {precision}")
 
     # Load model
     t0 = time.time()
@@ -506,26 +537,21 @@ def main(
         t0 = time.time()
         model = shard_model(model, dist.get_rank(), dist.get_world_size())
         torch.cuda.synchronize(device)
-        logger.info(f"Sharded model in {time.time() - t0:.02f} seconds")
 
     # Load tokenizer
     t0 = time.time()
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
-    logger.info(f"Loaded tokenizer in {time.time() - t0:.02f} seconds")
 
-    # if compile:
-    #     global create_block_mask
-    #     create_block_mask = torch.compile(create_block_mask)
+    if compile:
+        global create_block_mask
+        create_block_mask = torch.compile(create_block_mask, fullgraph=True)
 
-    #     global decode_one_token, prefill
-    #     decode_one_token = torch.compile(
-    #         decode_one_token, mode="reduce-overhead"
-    #     )  # fullgraph=True
+        global adjust_mask
+        adjust_mask = torch.compile(adjust_mask, fullgraph=True)
 
-    #     # Uncomment to squeeze more perf out of prefill
-    #     if compile_prefill:
-    #         prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+        global model_forward
+        model_forward = torch.compile(model_forward, fullgraph=True)
 
     # Encode prompt (batch_size, num_prompt_tokens)
     prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
