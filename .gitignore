@@ -4,6 +4,9 @@ __pycache__
 *.egg-info
 build
 
+# settings
+.vscode
+
 # data
 data
 checkpoints
