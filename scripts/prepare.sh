@@ -1,1 +1,1 @@
-python scripts/download.py --repo_id $1 && python scripts/convert_hf_checkpoint.py --checkpoint_dir checkpoints/$1 && python quantize.py --checkpoint_path checkpoints/$1/model.pth --mode int8
+uv run python scripts.download --repo_id $1 && uv run python -m scripts.convert_hf_checkpoint --checkpoint_dir checkpoints/$1
