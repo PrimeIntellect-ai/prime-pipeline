@@ -12,9 +12,10 @@ from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import P2PComm, TorchP2PComm, get_comm, setup_comm
+from comm import IrohP2PComm, P2PComm, get_comm, setup_comm
 from logger import get_logger, setup_logger
 from model import Transformer
+from serializer import PickleSerializer
 from tokenizer import get_tokenizer
 from utils import get_device, get_precision, load_model, seed_everything, shard_model
 from world import World, get_world, setup_world
@@ -390,9 +391,9 @@ def generate(
 
     Args:
         model: Transformer
-        prompt_tokens: Tensor of shape [batch_size, num_total_tokens]
+        prompt_tokens: Tensor of shape [batch_size, num_prompt_tokens]
+        num_new_tokens: int
         micro_batch_size: int
-        max_new_tokens: int
         **sampling_kwargs: Dict of kwargs for the sample function
     """
     # Setup model cache
@@ -453,8 +454,7 @@ def main(args: argparse.Namespace) -> None:
     logger = get_logger()
     logger.info("Starting")
     torch.cuda.synchronize()
-    if world.is_master:
-        logger.info(f"Args: {vars(args)}")
+    logger.info(f"Args: {vars(args)}")
 
     # Set seeds for reproducibility across all processes
     seed_everything(args.seed)
@@ -471,7 +471,9 @@ def main(args: argparse.Namespace) -> None:
 
     # Shard model
     if world.size > 1:
+        t0 = time.time()
         model = shard_model(model, world.rank, world.size)
+        logger.info(f"Sharded model in {time.time() - t0:.02f} seconds")
 
     # Compile model
     if args.compile:
@@ -503,19 +505,11 @@ def main(args: argparse.Namespace) -> None:
         if args.batch_size >= world.size
         else 1
     )
-    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    tokens_shape = (micro_batch_size, 1)
-    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
-    tokens_dtype = torch.long
-    setup_comm(
-        TorchP2PComm,
-        fwd_shape=hidden_states_shape,
-        bwd_shape=tokens_shape,
-        fwd_dtype=hidden_states_dtype,
-        bwd_dtype=tokens_dtype,
-        device=device,
-        num_prompt_tokens=prompt_tokens.size(-1),
-    )
+    # hidden_states_shape = (micro_batch_size, 1, model.config.dim)
+    # tokens_shape = (micro_batch_size, 1)
+    # hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
+    # tokens_dtype = torch.long
+    setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
     global comm
     comm = get_comm()
 
@@ -527,7 +521,7 @@ def main(args: argparse.Namespace) -> None:
         decoded_tokens = generate(
             model=model,
             prompt_tokens=prompt_tokens,
-            num_new_tokens=args.max_new_tokens,
+            num_new_tokens=args.num_new_tokens,
             micro_batch_size=micro_batch_size,
             temperature=args.temperature,
             top_k=args.top_k,
@@ -596,7 +590,10 @@ if __name__ == "__main__":
         "--num-samples", type=int, default=1, help="Number of samples to generate."
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, default=50, help="Maximum number of new tokens."
+        "--num-new-tokens",
+        type=int,
+        default=50,
+        help="Number of new tokens to generate.",
     )
     parser.add_argument("--top-k", type=int, default=200, help="Top-k for sampling.")
     parser.add_argument(

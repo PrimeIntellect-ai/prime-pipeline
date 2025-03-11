@@ -1,11 +1,14 @@
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Optional, Type
 
 import torch
 import torch.distributed as dist
+from iroh_py import create_connector
 
 from logger import get_logger
+from serializer import Serializer
 from world import get_world
 
 
@@ -14,11 +17,11 @@ class P2PComm(ABC):
         self.world = get_world()
 
     @abstractmethod
-    def send(self, data: bytes):
+    def send(self, data: torch.Tensor, **kwargs):
         pass
 
     @abstractmethod
-    def recv(self) -> bytes:
+    def recv(self, **kwargs) -> torch.Tensor:
         pass
 
     @abstractmethod
@@ -130,4 +133,43 @@ class TorchP2PComm(P2PComm):
 
 
 class IrohP2PComm(P2PComm):
-    pass
+    def __init__(self, serializer: Serializer, device: torch.device):
+        super().__init__()
+        self.serializer = serializer
+        self.logger = get_logger()
+        self.device = device
+
+        if self.world.size <= 1:
+            self.node = None
+            return
+
+        # Create iroh node
+        self.node = create_connector()
+        self.logger.info(f"Connect to node with: {self.node.get_node_id()}")
+
+        # Connect to the remote node
+        server_public_key = input("Please enter the server's public key: ").strip()
+        self.logger.info(f"Connecting to node with key: {server_public_key}")
+        self.node.connect(server_public_key)
+
+        # Wait for connection to be established
+        while not self.node.is_ready():
+            time.sleep(1 / 100)
+
+    def send(self, data: torch.Tensor, **kwargs) -> None:
+        if self.world.size == 1:
+            return None
+        serialized_data = self.serializer.serialize(data)
+        self.logger.info(f"Sending data to node with key: {self.node.get_node_id()}")
+        self.node.send(serialized_data)
+
+    def recv(self, **kwargs) -> torch.Tensor:
+        if self.world.size == 1:
+            return None
+        serialized_data = self.node.recv()
+        self.logger.info(f"Received data from node with key: {self.node.get_node_id()}")
+        return self.serializer.deserialize(serialized_data).to(self.device)
+
+    def destroy(self):
+        if self.node is not None:
+            self.node.shutdown()
