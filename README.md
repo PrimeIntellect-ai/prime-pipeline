@@ -5,7 +5,7 @@ Private fork of [gpt-fast](https://github.com/pytorch-labs/gpt-fast) for pipelin
 ## Usage
 
 ```bash
-git clone git@github.com:primeintellect-ai/gpt-fast.git && cd gpt-fast
+git clone git@github.com:primeintellect-ai/pipelined-gpt-fast.git && cd pipelined-gpt-fast
 ```
 
 Install dependencies via `uv`
@@ -22,12 +22,25 @@ export HF_TOKEN=...
 uv run bash scripts/prepare.sh $MODEL_REPO
 ```
 
-Test inference on single-node by generating 200 tokens
+Test inference on single-node by generating 200 tokens using `torchrun`
 
+```bash
+uv run torchrun --nproc-per-node 1 src/generate.py
 ```
-uv run generate.py \
-	--checkpoint_path checkpoints/$MODEL_REPO/model.pth \
-	--num_samples 1 \
-	--batch_size 1 \
-	--compile
+
+Or by populating the required environment variables yourself in different terminals
+
+```bash
+RANK=0 WORLD_SIZE=1 uv run python src/generate.py
+```
+
+Or move to a single-node multi-GPU setup by running
+
+```bash
+uv run torchrun --nproc-per-node 2 src/generate.py
+```
+
+```bash
+RANK=0 WORLD_SIZE=2 uv run python src/generate.py
+RANK=1 WORLD_SIZE=2 uv run python src/generate.py
 ```

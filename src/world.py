@@ -27,6 +27,7 @@ class World:
     def is_master(self) -> bool:
         return self.rank == 0
 
+
 _WORLD: Optional[World] = None
 
 

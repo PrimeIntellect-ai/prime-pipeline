@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Type
 
@@ -18,6 +19,10 @@ class P2PComm(ABC):
 
     @abstractmethod
     def recv(self) -> bytes:
+        pass
+
+    @abstractmethod
+    def destroy(self):
         pass
 
 
@@ -56,6 +61,10 @@ class TorchP2PComm(P2PComm):
         self.fwd_dtype, self.bwd_dtype = fwd_dtype, bwd_dtype
         self.device = device
         self.num_prompt_tokens = num_prompt_tokens
+        if not os.environ.get("MASTER_ADDR"):
+            os.environ["MASTER_ADDR"] = "localhost"
+        if not os.environ.get("MASTER_PORT"):
+            os.environ["MASTER_PORT"] = "29500"
         self.process_group = dist.init_process_group(
             init_method=init_method, backend=backend
         )
@@ -114,6 +123,10 @@ class TorchP2PComm(P2PComm):
         )
         _recv = self._recv_bwd if self.world.is_first_stage else self._recv_fwd
         return _recv(tag, shape[int(prefill)])
+
+    def destroy(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class IrohP2PComm(P2PComm):
