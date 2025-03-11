@@ -1,27 +1,24 @@
 # From: https://github.com/pytorch-labs/gpt-fast/blob/main/generate.py
 import argparse
-import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional
 
 # External imports
 import torch
 import torch._dynamo.config
 import torch._inductor.config
 import torch.distributed as dist
-from loguru import logger
 from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import P2PComm, TorchP2PComm
-
-# Local imports
+from comm import P2PComm, TorchP2PComm, get_comm, setup_comm
+from logger import get_logger, setup_logger
 from model import Transformer
 from tokenizer import get_tokenizer
 from utils import get_device, get_precision, load_model, seed_everything, shard_model
-from world import World
+from world import World, get_world, setup_world
 
 # Use lovely tensors
 monkey_patch()
@@ -33,8 +30,9 @@ torch._inductor.config.fx_graph_cache = True
 torch._functorch.config.enable_autograd_cache = True
 
 # Globals
-world: Optional[World] = None
+logger: Optional[Any] = None
 comm: Optional[P2PComm] = None
+world: Optional[World] = None
 
 
 def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
@@ -76,74 +74,6 @@ def sample(
     probs = logits_to_probs(logits[:, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next
-
-
-def maybe_sample(logits: Tensor, **sampling_kwargs) -> Optional[Tensor]:
-    return sample(logits, **sampling_kwargs) if world.is_last_stage else None
-
-
-class WaitIfNecessary:
-    def __init__(self, req):
-        self.req = req
-
-    def wait(self):
-        if hasattr(self.req, "wait"):
-            self.req.wait()
-
-
-def maybe_recv_fwd(
-    shape: Tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-    tag: int,
-    do_async: bool = True,
-) -> Tuple[Optional[Tensor], WaitIfNecessary]:
-    if world.size == 1 or world.is_first_stage:
-        return None, None
-
-    # Initialize receive tensor
-    recv_tensor = torch.empty(size=shape, dtype=dtype, device=device)
-
-    # Receive tensor
-    recv = dist.irecv if do_async else dist.recv
-    logger.debug(
-        f"Scheduled recv_fwd {tag=} {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
-    )
-    recv_req = recv(recv_tensor, src=world.rank - 1, tag=tag)
-
-    return recv_tensor, WaitIfNecessary(recv_req)
-
-
-def maybe_send_fwd(tensor: Tensor, tag: int) -> None:
-    if world.size == 1 or world.is_last_stage:
-        return
-    logger.debug(f"send_fwd {tensor=} {tag=}")
-    dist.send(tensor, dst=world.rank + 1, tag=tag)
-
-
-def maybe_recv_bwd(
-    shape: Tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-    tag: int,
-    do_async: bool = True,
-) -> Tuple[Optional[Tensor], WaitIfNecessary]:
-    if world.size == 1 or world.rank != 0:  # only first stage
-        return None, None
-    recv_tensor = torch.empty(size=shape, dtype=dtype, device=device)
-    recv = dist.irecv if do_async else dist.recv
-    logger.debug(
-        f"Scheduled recv_bwd {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
-    )
-    recv_req = recv(recv_tensor, src=world.size - 1, tag=tag)
-    return recv_tensor, WaitIfNecessary(recv_req)
-
-
-def maybe_send_bwd(tensor: Tensor, tag: int) -> None:
-    if world.size == 1 or world.rank != world.size - 1:
-        return
-    logger.debug(f"send_bwd {tensor=} {tag=}")
-    dist.send(tensor, dst=0, tag=tag)
 
 
 def causal_mask(b, h, q, kv):
@@ -248,7 +178,6 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        print(f"{world.rank=} {outputs=}")
         comm.send(outputs, tag=micro_batch_idx)
 
         if world.is_first_stage:
@@ -515,18 +444,16 @@ def generate(
 
 def main(args: argparse.Namespace) -> None:
     # Setup world and communication
+    setup_world()
     global world
-    world = World()
+    world = get_world()
 
     # Initialize logger
+    setup_logger(world.rank, log_level=args.log_level)
     global logger
-    console_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> [<level>{level}</level>] [<level>Rank {extra[rank]}</level>] - <level>{message}</level>"
-    logger.remove()
-    logger.add(sys.stdout, level=args.log_level, format=console_format)
-    logger = logger.bind(rank=world.rank)
+    logger = get_logger()
     logger.info("Starting")
-    if world.is_master:
-        logger.info(f"Config: {vars(args)}")
+    logger.info(f"Args: {vars(args)}")
 
     # Set seeds for reproducibility across all processes
     seed_everything(args.seed)
@@ -571,22 +498,23 @@ def main(args: argparse.Namespace) -> None:
     ).repeat(args.batch_size, 1)
 
     # Initialize communication
-    global comm
     batch_size = args.batch_size
     micro_batch_size = batch_size // world.size if batch_size >= world.size else 1
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)
     tokens_shape = (micro_batch_size, 1)
     hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
     tokens_dtype = torch.long
-    comm = TorchP2PComm(
-        world,
+    setup_comm(
+        TorchP2PComm,
         fwd_shape=hidden_states_shape,
         bwd_shape=tokens_shape,
         fwd_dtype=hidden_states_dtype,
         bwd_dtype=tokens_dtype,
-        num_prompt_tokens=prompt_tokens.size(-1),
         device=device,
+        num_prompt_tokens=prompt_tokens.size(-1),
     )
+    global comm
+    comm = get_comm()
 
     start = -1 if args.compile else 0
     metrics = {"latency": [], "tps": []}

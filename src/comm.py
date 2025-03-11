@@ -1,14 +1,16 @@
 from abc import ABC, abstractmethod
+from typing import Optional, Type
 
 import torch
 import torch.distributed as dist
 
-from world import World
+from logger import get_logger
+from world import get_world
 
 
 class P2PComm(ABC):
-    def __init__(self, world: World):
-        self.world = world
+    def __init__(self):
+        self.world = get_world()
 
     @abstractmethod
     def send(self, data: bytes):
@@ -19,20 +21,35 @@ class P2PComm(ABC):
         pass
 
 
+_COMM: Optional[P2PComm] = None
+
+
+def setup_comm(target: Type[P2PComm], **kwargs):
+    global _COMM
+    assert _COMM is None, "Comm already setup"
+    _COMM = target(**kwargs)
+
+
+def get_comm() -> P2PComm:
+    global _COMM
+    assert _COMM is not None, "Comm not setup"
+    return _COMM
+
+
 class TorchP2PComm(P2PComm):
     def __init__(
         self,
-        world: World,
         fwd_shape: tuple[int, ...],
         bwd_shape: tuple[int, ...],
+        fwd_dtype: torch.dtype,
+        bwd_dtype: torch.dtype,
         device: torch.device,
         num_prompt_tokens: int,
-        fwd_dtype: torch.dtype = torch.bfloat16,
-        bwd_dtype: torch.dtype = torch.long,
         init_method: str = "env://",
         backend: str = "nccl",
     ):
-        super().__init__(world)
+        super().__init__()
+        self.logger = get_logger()
         self.fwd_shape, self.bwd_shape = fwd_shape, bwd_shape
         self.fwd_prefill_shape = (fwd_shape[0], num_prompt_tokens, fwd_shape[2])
         self.bwd_prefill_shape = bwd_shape
@@ -47,12 +64,14 @@ class TorchP2PComm(P2PComm):
         """Sends hidden states to the next stage"""
         next_rank = self.world.rank + 1
         assert next_rank < self.world.size
-        # print(f"{self.world.rank=} send_fwd to {next_rank=}")
+        self.logger.debug(f"send_fwd {hidden_states=} to {next_rank=} with {tag=}")
         dist.send(hidden_states, dst=next_rank, tag=tag)
 
     def _send_bwd(self, next_token: torch.Tensor, tag: int) -> None:
         """Sends next token to the first stage"""
-        # print(f"{self.world.rank=} send_bwd to {self.world.first_stage_rank=}")
+        self.logger.debug(
+            f"send_bwd {next_token=} to {self.world.first_stage_rank=} with {tag=}"
+        )
         dist.send(next_token, dst=self.world.first_stage_rank, tag=tag)
 
     def _recv_fwd(self, tag: int, shape: tuple[int, ...]) -> torch.Tensor:
@@ -60,17 +79,21 @@ class TorchP2PComm(P2PComm):
         prev_rank = self.world.rank - 1
         assert prev_rank >= 0
         hidden_states = torch.empty(shape, dtype=self.fwd_dtype, device=self.device)
-        # print(f"{self.world.rank=} recv_fwd into {hidden_states=} from {prev_rank=}")
+        self.logger.debug(
+            f"recv_fwd into {hidden_states=} from {prev_rank=} with {tag=}"
+        )
         dist.recv(hidden_states, src=prev_rank, tag=tag)
+        self.logger.debug(f"recv_fwd done {hidden_states=}")
         return hidden_states
 
     def _recv_bwd(self, tag: int, shape: tuple[int, ...]) -> torch.Tensor:
         """Receives next token from the last stage"""
         next_token = torch.empty(shape, dtype=self.bwd_dtype, device=self.device)
-        # print(
-        #     f"{self.world.rank=} recv_bwd into {next_token=} from {self.world.last_stage_rank=}"
-        # )
+        self.logger.debug(
+            f"recv_bwd into {next_token=} from {self.world.last_stage_rank=} with {tag=}"
+        )
         dist.recv(next_token, src=self.world.last_stage_rank, tag=tag)
+        self.logger.debug(f"recv_bwd done {next_token=}")
         return next_token
 
     def send(self, tensor: torch.Tensor, tag: int) -> None:

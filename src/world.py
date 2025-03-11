@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 
 
 class World:
@@ -25,3 +26,17 @@ class World:
     @property
     def is_master(self) -> bool:
         return self.rank == 0
+
+_WORLD: Optional[World] = None
+
+
+def setup_world():
+    global _WORLD
+    assert _WORLD is None, "World already setup"
+    _WORLD = World()
+
+
+def get_world() -> World:
+    global _WORLD
+    assert _WORLD is not None, "World not setup"
+    return _WORLD
