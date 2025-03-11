@@ -2,7 +2,6 @@
 import argparse
 import sys
 import time
-from functools import partial
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -16,10 +15,13 @@ from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
+from comm import P2PComm, TorchP2PComm
+
 # Local imports
 from model import Transformer
 from tokenizer import get_tokenizer
 from utils import get_device, get_precision, load_model, seed_everything, shard_model
+from world import World
 
 # Use lovely tensors
 monkey_patch()
@@ -30,9 +32,9 @@ torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True
 torch._functorch.config.enable_autograd_cache = True
 
-# Support running without installing as a package
-wd = Path(__file__).parent.parent.resolve()
-sys.path.append(str(wd))
+# Globals
+world: Optional[World] = None
+comm: Optional[P2PComm] = None
 
 
 def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
@@ -77,9 +79,7 @@ def sample(
 
 
 def maybe_sample(logits: Tensor, **sampling_kwargs) -> Optional[Tensor]:
-    if dist.get_rank() == dist.get_world_size() - 1:
-        return sample(logits, **sampling_kwargs)
-    return None
+    return sample(logits, **sampling_kwargs) if world.is_last_stage else None
 
 
 class WaitIfNecessary:
@@ -98,7 +98,7 @@ def maybe_recv_fwd(
     tag: int,
     do_async: bool = True,
 ) -> Tuple[Optional[Tensor], WaitIfNecessary]:
-    if dist.get_world_size() == 1 or dist.get_rank() == 0:
+    if world.size == 1 or world.is_first_stage:
         return None, None
 
     # Initialize receive tensor
@@ -109,16 +109,16 @@ def maybe_recv_fwd(
     logger.debug(
         f"Scheduled recv_fwd {tag=} {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
     )
-    recv_req = recv(recv_tensor, src=dist.get_rank() - 1, tag=tag)
+    recv_req = recv(recv_tensor, src=world.rank - 1, tag=tag)
 
     return recv_tensor, WaitIfNecessary(recv_req)
 
 
 def maybe_send_fwd(tensor: Tensor, tag: int) -> None:
-    if dist.get_world_size() == 1 or dist.get_rank() == dist.get_world_size() - 1:
+    if world.size == 1 or world.is_last_stage:
         return
     logger.debug(f"send_fwd {tensor=} {tag=}")
-    dist.send(tensor, dst=dist.get_rank() + 1, tag=tag)
+    dist.send(tensor, dst=world.rank + 1, tag=tag)
 
 
 def maybe_recv_bwd(
@@ -128,19 +128,19 @@ def maybe_recv_bwd(
     tag: int,
     do_async: bool = True,
 ) -> Tuple[Optional[Tensor], WaitIfNecessary]:
-    if dist.get_world_size() == 1 or dist.get_rank() != 0:  # only first stage
+    if world.size == 1 or world.rank != 0:  # only first stage
         return None, None
     recv_tensor = torch.empty(size=shape, dtype=dtype, device=device)
     recv = dist.irecv if do_async else dist.recv
     logger.debug(
         f"Scheduled recv_bwd {recv_tensor.shape=} {recv_tensor.dtype=} {recv_tensor.device=} {tag=}"
     )
-    recv_req = recv(recv_tensor, src=dist.get_world_size() - 1, tag=tag)
+    recv_req = recv(recv_tensor, src=world.size - 1, tag=tag)
     return recv_tensor, WaitIfNecessary(recv_req)
 
 
 def maybe_send_bwd(tensor: Tensor, tag: int) -> None:
-    if dist.get_world_size() == 1 or dist.get_rank() != dist.get_world_size() - 1:
+    if world.size == 1 or world.rank != world.size - 1:
         return
     logger.debug(f"send_bwd {tensor=} {tag=}")
     dist.send(tensor, dst=0, tag=tag)
@@ -216,32 +216,6 @@ def prefill(
         f"prefill(model, {len(batched_prompt_tokens)=}, {batched_prompt_tokens[0]=}, {input_pos=})"
     )
 
-    # Setup shapes, dtypes, device
-    micro_batch_size = batched_prompt_tokens[0].shape[0]
-    tokens_shape = (micro_batch_size, 1)
-    tokens_dtype = torch.long  # TODO: dont hardcode
-    hidden_states_shape = (micro_batch_size, batched_prompt_tokens[0].size(1), 4096)
-    hidden_states_dtype = model.layers[
-        0
-    ].feed_forward.w1.weight.dtype  # TODO: Cleaner way
-    device = batched_prompt_tokens[0].device
-
-    # Partially apply recv functions
-    rank_maybe_recv_fwd = partial(
-        maybe_recv_fwd,
-        shape=hidden_states_shape,
-        dtype=hidden_states_dtype,
-        device=device,
-        do_async=False,
-    )
-    rank_maybe_recv_bwd = partial(
-        maybe_recv_bwd,
-        shape=tokens_shape,
-        dtype=tokens_dtype,
-        device=device,
-        do_async=False,
-    )
-
     # Create block mask
     block_mask = create_block_mask(
         causal_mask,
@@ -253,8 +227,13 @@ def prefill(
     )
 
     batched_next_token = []
+    next_token, hidden_states = None, None
     for micro_batch_idx, prompt_tokens in enumerate(batched_prompt_tokens):
-        hidden_states, _ = rank_maybe_recv_fwd(tag=micro_batch_idx)
+        # Receive hidden states from previous stage
+        if not world.is_first_stage:
+            hidden_states = comm.recv(tag=micro_batch_idx, prefill=True)
+
+        # Forward pass
         outputs = model_forward(
             model,
             micro_batch_idx,
@@ -263,18 +242,27 @@ def prefill(
             input_pos,
             hidden_states,
         )
-        maybe_send_fwd(outputs, tag=micro_batch_idx)
-        next_token = maybe_sample(outputs, **sampling_kwargs)
-        if next_token is None:
-            next_token, _ = rank_maybe_recv_bwd(tag=micro_batch_idx)
-        maybe_send_bwd(next_token, tag=micro_batch_idx)
-        if dist.get_rank() == 0:
+
+        # Sample next token
+        if world.is_last_stage:
+            outputs = sample(outputs, **sampling_kwargs)
+
+        # Send hidden states or next token to next stage
+        print(f"{world.rank=} {outputs=}")
+        comm.send(outputs, tag=micro_batch_idx)
+
+        if world.is_first_stage:
+            # Receive next token from last stage
+            if world.size == 1:
+                next_token = outputs
+            else:
+                next_token = comm.recv(tag=micro_batch_idx, prefill=True)
             batched_next_token.append(next_token)
 
-    return torch.cat(batched_next_token, dim=0) if dist.get_rank() == 0 else None
+    return torch.cat(batched_next_token, dim=0) if world.is_first_stage else None
 
 
-def decode_n_tokens(
+def decode(
     model: Transformer,
     batched_cur_tokens: Optional[List[Tensor]],
     input_pos: Tensor,
@@ -302,29 +290,10 @@ def decode_n_tokens(
         next_tokens: Tensor of shape [batch_size, num_new_tokens]
     """
     logger.debug(
-        f"decode_n_tokens(model, {batched_cur_tokens=}, {input_pos=}, {batch_size=}, {micro_batch_size=}, {num_new_tokens=})"
+        f"decode(model, {batched_cur_tokens=}, {input_pos=}, {batch_size=}, {micro_batch_size=}, {num_new_tokens=})"
     )
 
-    # Setup shapes, dtypes, device
     num_micro_batches = batch_size // micro_batch_size
-    tokens_shape = (micro_batch_size, 1)
-    tokens_dtype = torch.long  # TODO: dont hardcode
-    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    hidden_states_dtype = precision
-
-    # Setup receive and send functions
-    recv = partial(
-        maybe_recv_bwd if dist.get_rank() == 0 else maybe_recv_fwd,
-        shape=tokens_shape if dist.get_rank() == 0 else hidden_states_shape,
-        dtype=tokens_dtype if dist.get_rank() == 0 else hidden_states_dtype,
-        do_async=True if dist.get_rank() == 0 else False,
-        device=device,
-    )
-    send = (
-        maybe_send_bwd
-        if dist.get_rank() == dist.get_world_size() - 1
-        else maybe_send_fwd
-    )
 
     # Create block mask
     block_mask = create_block_mask(
@@ -336,84 +305,132 @@ def decode_n_tokens(
         device=device,
     )
 
-    # Setup receive buffers
-    recv_reqs = [None] * num_micro_batches
-    recv_buffers = [None] * num_micro_batches
-
-    # Prefill pipeline on first stage
-    if dist.get_rank() == 0 and dist.get_world_size() > 1:
+    batched_cur_tokens = (
+        batched_cur_tokens
+        if batched_cur_tokens is not None
+        else [None] * num_micro_batches
+    )
+    batched_decoded_tokens = []
+    next_token, hidden_states = None, None
+    for _ in range(num_new_tokens):
+        batched_next_token = []
+        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         for micro_batch_idx in range(num_micro_batches):
-            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-            hidden_states = model_forward(
+            # Receive hidden states from previous stage
+            if not world.is_first_stage:
+                hidden_states = comm.recv(tag=micro_batch_idx)
+
+            # Forward pass
+            outputs = model_forward(
                 model,
                 micro_batch_idx,
                 mask,
                 batched_cur_tokens[micro_batch_idx],
                 input_pos,
+                hidden_states,
             )
-            send(hidden_states, tag=micro_batch_idx)
-            recv_tensor, recv_req = recv(tag=micro_batch_idx)
-            recv_reqs[micro_batch_idx] = recv_req
-            recv_buffers[micro_batch_idx] = recv_tensor
-        input_pos += 1
 
-    # Decode auto-regressively
-    batched_decoded_tokens = []  # List[Tensor[batch_size, 1]] of length num_new_tokens
-    for token_idx in range(num_new_tokens):
-        batched_next_tokens = []
-        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-        for micro_batch_idx in range(num_micro_batches):
-            # Wait for requests
-            if dist.get_world_size() == 1:
-                logits = model_forward(
-                    model,
-                    micro_batch_idx,
-                    mask,
-                    batched_cur_tokens[micro_batch_idx],
-                    input_pos,
-                )
-                next_token = sample(logits, **sampling_kwargs)
-                batched_next_tokens.append(next_token)
+            # Sample next token
+            if world.is_last_stage:
+                outputs = sample(outputs, **sampling_kwargs)
+
+            # Send hidden states or next token to next stage
+            comm.send(outputs, tag=micro_batch_idx)
+
+            if world.is_first_stage:
+                # Receive next token from last stage
+                if world.size == 1:
+                    next_token = outputs
+                else:
+                    next_token = comm.recv(tag=micro_batch_idx)
                 batched_cur_tokens[micro_batch_idx] = next_token
-            else:
-                if dist.get_rank() == 0:
-                    recv_reqs[micro_batch_idx].wait()
-                    next_token = recv_buffers[micro_batch_idx].clone()
-                    batched_cur_tokens[micro_batch_idx] = next_token
-                    batched_next_tokens.append(next_token)
+                batched_next_token.append(next_token)
 
-                    if token_idx < num_new_tokens - 1:
-                        hidden_states = model_forward(
-                            model,
-                            micro_batch_idx,
-                            mask,
-                            batched_cur_tokens[micro_batch_idx],
-                            input_pos,
-                        )
-                        send(hidden_states, tag=micro_batch_idx)
-
-                        recv_tensor, recv_req = recv(tag=micro_batch_idx)
-                        recv_reqs[micro_batch_idx] = recv_req
-                        recv_buffers[micro_batch_idx] = recv_tensor
-                else:  # intermediate aand last stage
-                    hidden_states, _ = recv(tag=micro_batch_idx)
-                    output = model_forward(
-                        model,
-                        micro_batch_idx,
-                        mask,
-                        None,
-                        input_pos,
-                        hidden_states,
-                    )
-                    next_token = maybe_sample(output, **sampling_kwargs)
-                    send_tensor = next_token if next_token is not None else output
-                    send(send_tensor, tag=micro_batch_idx)
-
-        if dist.get_rank() == 0:
-            batched_decoded_tokens.append(torch.cat(batched_next_tokens, dim=0))
+        if world.is_first_stage:
+            batched_decoded_tokens.append(torch.cat(batched_next_token, dim=0))
         input_pos += 1
 
-    return torch.cat(batched_decoded_tokens, dim=-1) if dist.get_rank() == 0 else None
+    return torch.cat(batched_decoded_tokens, dim=-1) if world.is_first_stage else None
+
+    ### TODO: Make asynch communication work
+    # Setup receive buffers
+    # recv_reqs = [None] * num_micro_batches
+    # recv_buffers = [None] * num_micro_batches
+
+    # # Prefill pipeline on first stage
+    # if world.rank == 0 and world.size > 1:
+    #     for micro_batch_idx in range(num_micro_batches):
+    #         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+    #         hidden_states = model_forward(
+    #             model,
+    #             micro_batch_idx,
+    #             mask,
+    #             batched_cur_tokens[micro_batch_idx],
+    #             input_pos,
+    #         )
+    #         send(hidden_states, tag=micro_batch_idx)
+    #         recv_tensor, recv_req = recv(tag=micro_batch_idx)
+    #         recv_reqs[micro_batch_idx] = recv_req
+    #         recv_buffers[micro_batch_idx] = recv_tensor
+    #     input_pos += 1
+
+    # # Decode auto-regressively
+    # batched_decoded_tokens = []  # List[Tensor[batch_size, 1]] of length num_new_tokens
+    # for token_idx in range(num_new_tokens):
+    #     batched_next_tokens = []
+    #     mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+    #     for micro_batch_idx in range(num_micro_batches):
+    #         # Wait for requests
+    #         if world.size == 1:
+    #             logits = model_forward(
+    #                 model,
+    #                 micro_batch_idx,
+    #                 mask,
+    #                 batched_cur_tokens[micro_batch_idx],
+    #                 input_pos,
+    #             )
+    #             next_token = sample(logits, **sampling_kwargs)
+    #             batched_next_tokens.append(next_token)
+    #             batched_cur_tokens[micro_batch_idx] = next_token
+    #         else:
+    #             if world.rank == 0:
+    #                 recv_reqs[micro_batch_idx].wait()
+    #                 next_token = recv_buffers[micro_batch_idx].clone()
+    #                 batched_cur_tokens[micro_batch_idx] = next_token
+    #                 batched_next_tokens.append(next_token)
+
+    #                 if token_idx < num_new_tokens - 1:
+    #                     hidden_states = model_forward(
+    #                         model,
+    #                         micro_batch_idx,
+    #                         mask,
+    #                         batched_cur_tokens[micro_batch_idx],
+    #                         input_pos,
+    #                     )
+    #                     send(hidden_states, tag=micro_batch_idx)
+
+    #                     recv_tensor, recv_req = recv(tag=micro_batch_idx)
+    #                     recv_reqs[micro_batch_idx] = recv_req
+    #                     recv_buffers[micro_batch_idx] = recv_tensor
+    #             else:  # intermediate aand last stage
+    #                 hidden_states, _ = recv(tag=micro_batch_idx)
+    #                 output = model_forward(
+    #                     model,
+    #                     micro_batch_idx,
+    #                     mask,
+    #                     None,
+    #                     input_pos,
+    #                     hidden_states,
+    #                 )
+    #                 next_token = maybe_sample(output, **sampling_kwargs)
+    #                 send_tensor = next_token if next_token is not None else output
+    #                 send(send_tensor, tag=micro_batch_idx)
+
+    #     if world.rank == 0:
+    #         batched_decoded_tokens.append(torch.cat(batched_next_tokens, dim=0))
+    #     input_pos += 1
+
+    # return torch.cat(batched_decoded_tokens, dim=-1) if world.rank == 0 else None
 
 
 @torch.no_grad()
@@ -434,9 +451,7 @@ def generate(
     """
     # Setup sequence length and microbatching
     batch_size, num_prompt_tokens = prompt_tokens.shape
-    num_micro_batches = (
-        dist.get_world_size() if batch_size >= dist.get_world_size() else 1
-    )
+    num_micro_batches = world.size if batch_size >= world.size else 1
     seq_length = min(num_prompt_tokens + max_new_tokens, model.config.block_size)
     micro_batch_size = batch_size // num_micro_batches
 
@@ -469,8 +484,8 @@ def generate(
         input_pos=input_pos,
         **sampling_kwargs,
     )
-    batched_cur_tokens = []
-    if dist.get_rank() == 0:
+    batched_cur_tokens = None
+    if world.is_master:
         logger.info(f"Prefilled tokens {next_token=}")
         decoded_tokens[:, num_prompt_tokens] = next_token.squeeze()
         batched_cur_tokens = list(torch.split(next_token, micro_batch_size, dim=0))
@@ -480,7 +495,7 @@ def generate(
     num_new_tokens = max_new_tokens - 1
     if num_new_tokens == 0:
         return decoded_tokens
-    next_tokens = decode_n_tokens(
+    next_tokens = decode(
         model=model,
         batch_size=batch_size,
         micro_batch_size=micro_batch_size,
@@ -491,7 +506,7 @@ def generate(
         precision=precision,
         **sampling_kwargs,
     )
-    if dist.get_rank() == 0:
+    if world.rank == 0:
         logger.info(f"Decoded tokens {next_tokens=}")
         decoded_tokens[:, num_prompt_tokens + 1 :] = next_tokens
 
@@ -499,30 +514,25 @@ def generate(
 
 
 def main(args: argparse.Namespace) -> None:
-    # Setup process group
-    dist.init_process_group(
-        backend=args.backend
-        if args.backend
-        else "nccl"
-        if args.device == "cuda"
-        else "gloo"
-    )
+    # Setup world and communication
+    global world
+    world = World()
 
     # Initialize logger
     global logger
     console_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> [<level>{level}</level>] [<level>Rank {extra[rank]}</level>] - <level>{message}</level>"
     logger.remove()
     logger.add(sys.stdout, level=args.log_level, format=console_format)
-    logger = logger.bind(rank=dist.get_rank())
+    logger = logger.bind(rank=world.rank)
     logger.info("Starting")
-    if dist.get_rank() == 0:
+    if world.is_master:
         logger.info(f"Config: {vars(args)}")
 
     # Set seeds for reproducibility across all processes
     seed_everything(args.seed)
 
     # Set device and precision
-    device = get_device(args.device)
+    device = get_device(args.device, world)
     precision = get_precision(args.precision)
 
     # Load model
@@ -533,9 +543,9 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"Loaded model in {time.time() - t0:.02f} seconds")
 
     # Shard model
-    if dist.get_world_size() > 1:
+    if world.size > 1:
         t0 = time.time()
-        model = shard_model(model, dist.get_rank(), dist.get_world_size())
+        model = shard_model(model, world.rank, world.size)
         torch.cuda.synchronize()
 
     # Load tokenizer
@@ -559,6 +569,24 @@ def main(args: argparse.Namespace) -> None:
         prompt_tokens,
         device=device,
     ).repeat(args.batch_size, 1)
+
+    # Initialize communication
+    global comm
+    batch_size = args.batch_size
+    micro_batch_size = batch_size // world.size if batch_size >= world.size else 1
+    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
+    tokens_shape = (micro_batch_size, 1)
+    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
+    tokens_dtype = torch.long
+    comm = TorchP2PComm(
+        world,
+        fwd_shape=hidden_states_shape,
+        bwd_shape=tokens_shape,
+        fwd_dtype=hidden_states_dtype,
+        bwd_dtype=tokens_dtype,
+        num_prompt_tokens=prompt_tokens.size(-1),
+        device=device,
+    )
 
     start = -1 if args.compile else 0
     metrics = {"latency": [], "tps": []}
@@ -590,13 +618,13 @@ def main(args: argparse.Namespace) -> None:
         metrics["tps"].append(num_generated_tokens / time_taken)
 
         # Print generations (on main rank)
-        if dist.get_rank() == 0:
+        if world.rank == 0:
             logger.info(
                 f"First generation: {tokenizer.decode(decoded_tokens[0].tolist())}"
             )
 
     # Print metrics (on main rank)
-    if dist.get_rank() == 0:
+    if world.rank == 0:
         logger.info(f"Batch Size: {args.batch_size}")
         logger.info(f"Number of prompt tokens: {num_prompt_tokens}")
         logger.info(f"Number of generated tokens: {num_generated_tokens}")
@@ -609,6 +637,7 @@ def main(args: argparse.Namespace) -> None:
         )
         logger.info(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
+    # TODO: Destroy communication
     dist.destroy_process_group()
 
 

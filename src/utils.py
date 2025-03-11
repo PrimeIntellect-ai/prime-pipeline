@@ -1,9 +1,9 @@
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 
 from model import Transformer, TransformerShard
+from world import World
 
 
 def seed_everything(seed: int) -> None:
@@ -14,9 +14,9 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def get_device(device: str) -> torch.device:
+def get_device(device: str, world: World) -> torch.device:
     if device == "cuda":
-        return torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+        return torch.device(f"cuda:{world.rank % torch.cuda.device_count()}")
     elif device == "cpu":
         return torch.device("cpu")
     else:
