@@ -1,5 +1,5 @@
 [project]
-name = "gpt-fast"
+name = "pipelined-gpt-fast"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -13,12 +13,20 @@ dependencies = [
     "setuptools>=75.8.2",
     "torch>=2.6.0",
     "triton>=3.2.0",
+    "maturin>=1.8.2",
     "loguru>=0.7.3",
 ]
 
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = []
+
 [dependency-groups]
 dev = [
-    "ipykernel>=6.29.5",
     "lovely-tensors>=0.1.18",
+    "pytest>=8.3.5",
     "ruff>=0.9.10",
 ]

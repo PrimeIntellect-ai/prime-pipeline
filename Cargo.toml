@@ -1,0 +1,15 @@
+[package]
+name = "iroh-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "iroh_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+iroh = "0.33.0"
+pyo3 = { version = "0.24.0", features = ["extension-module"] }
+tokio = { version = "1.29.0", features = ["full"] }
+anyhow = "1.0.75"
+hex = "0.4.3"

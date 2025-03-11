@@ -18,3 +18,6 @@ original_adapter.py
 # environment variables
 .env
 logs
+
+# compiled bindings
+target/
