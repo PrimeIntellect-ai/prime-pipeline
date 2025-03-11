@@ -45,25 +45,17 @@ export MODEL_REPO=meta-llama/Llama-2-7b-chat-hf
 uv run bash scripts/prepare.sh $MODEL_REPO
 ```
 
-Test inference on single-node by generating 200 tokens using `torchrun`
-
-```bash
-uv run torchrun --nproc-per-node 1 src/generate.py
-```
-
-Or by populating the required environment variables yourself in different terminals
+Test inference on single-node
 
 ```bash
 RANK=0 WORLD_SIZE=1 uv run python src/generate.py
 ```
 
-Or move to a single-node multi-GPU setup by running
-
-```bash
-uv run torchrun --nproc-per-node 2 src/generate.py
-```
+Test distributed inference by running in two terminals (tmux sessions recommended)
 
 ```bash
 RANK=0 WORLD_SIZE=2 uv run python src/generate.py
 RANK=1 WORLD_SIZE=2 uv run python src/generate.py
 ```
+
+To checkout out all generation options, run `uv run python src/generate.py -h`.
