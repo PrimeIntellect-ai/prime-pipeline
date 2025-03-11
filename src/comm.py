@@ -5,8 +5,8 @@ from typing import Optional, Type
 
 import torch
 import torch.distributed as dist
-from iroh_py import create_connector
 
+from iroh_py import create_connector
 from logger import get_logger
 from serializer import Serializer
 from world import get_world
@@ -17,11 +17,11 @@ class P2PComm(ABC):
         self.world = get_world()
 
     @abstractmethod
-    def send(self, data: torch.Tensor, **kwargs):
+    def send(self, data: bytes):
         pass
 
     @abstractmethod
-    def recv(self, **kwargs) -> torch.Tensor:
+    def recv(self) -> bytes:
         pass
 
     @abstractmethod
@@ -136,11 +136,11 @@ class IrohP2PComm(P2PComm):
     def __init__(self, serializer: Serializer, device: torch.device):
         super().__init__()
         self.serializer = serializer
-        self.logger = get_logger()
         self.device = device
+        self.logger = get_logger()
+        self.node = None
 
         if self.world.size <= 1:
-            self.node = None
             return
 
         # Create iroh node

@@ -13,20 +13,12 @@ dependencies = [
     "setuptools>=75.8.2",
     "torch>=2.6.0",
     "triton>=3.2.0",
-    "maturin>=1.8.2",
     "loguru>=0.7.3",
+    "iroh_py",
 ]
-
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
-
-[tool.maturin]
-features = []
 
 [dependency-groups]
-dev = [
-    "lovely-tensors>=0.1.18",
-    "pytest>=8.3.5",
-    "ruff>=0.9.10",
-]
+dev = ["lovely-tensors>=0.1.18", "pytest>=8.3.5", "ruff>=0.9.10"]
+
+[tool.uv.sources]
+iroh_py = { path = "iroh_py", editable = true }
