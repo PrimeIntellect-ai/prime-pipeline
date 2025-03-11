@@ -8,17 +8,40 @@ Private fork of [gpt-fast](https://github.com/pytorch-labs/gpt-fast) for pipelin
 git clone git@github.com:primeintellect-ai/pipelined-gpt-fast.git && cd pipelined-gpt-fast
 ```
 
-Install dependencies via `uv`
+Install rust
+
+```bash
+curl https://sh.rustup.rs -sSf | sh
+```
+
+And add to path
+
+```bash
+. "$HOME/.cargo/env"
+```
+
+Install uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Install dependencies
+
+```bash
 uv sync
 ```
 
-Prepare model for generation
-```
-export MODEL_REPO=meta-llama/Llama-3.2-3B
+Set your Hugging Face token if model has restricted access
+
+```bash
 export HF_TOKEN=...
+```
+
+Download and convert model to required format
+
+```bash
+export MODEL_REPO=meta-llama/Llama-2-7b-chat-hf
 uv run bash scripts/prepare.sh $MODEL_REPO
 ```
 
