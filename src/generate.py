@@ -12,7 +12,7 @@ from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import IrohP2PComm, P2PComm, get_comm, setup_comm, TorchP2PComm
+from comm import IrohP2PComm, P2PComm, get_comm, setup_comm
 from logger import get_logger, setup_logger
 from model import Transformer
 from serializer import PickleSerializer
@@ -296,7 +296,7 @@ def decode(
                 cur_tokens,
                 input_pos,
             )
-            send_reqs[micro_batch_idx] = comm.isend(hidden_states, tag=micro_batch_idx)
+            comm.send(hidden_states, tag=micro_batch_idx)
             recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
         
     # Decode interleaved
@@ -331,14 +331,12 @@ def decode(
                 outputs = sample(outputs, **sampling_kwargs)
 
             # Send hidden states or next token
-            send_reqs[micro_batch_idx] = comm.isend(outputs, tag=micro_batch_idx)
+            comm.send(outputs, tag=micro_batch_idx)
             
             # Schedule next recv
             if world.is_first_stage:
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
 
-        # Wait for all sends to complete
-        [req.wait() for req in send_reqs]
 
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
 
@@ -462,20 +460,22 @@ def main(args: argparse.Namespace) -> None:
         if args.batch_size >= world.size
         else 1
     )
-    num_prompt_tokens = prompt_tokens.size(-1)
-    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    tokens_shape = (micro_batch_size, 1)
-    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
-    tokens_dtype = torch.long
-    setup_comm(TorchP2PComm, 
-            fwd_shape=hidden_states_shape,
-            bwd_shape=tokens_shape,
-            fwd_dtype=hidden_states_dtype,
-            bwd_dtype=tokens_dtype,
-            device=device,
-            num_prompt_tokens=num_prompt_tokens,
-    )
+    # num_prompt_tokens = prompt_tokens.size(-1)
+    # hidden_states_shape = (micro_batch_size, 1, model.config.dim)
+    # tokens_shape = (micro_batch_size, 1)
+    # hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
+    # tokens_dtype = torch.long
+    # setup_comm(TorchP2PComm, 
+    #         fwd_shape=hidden_states_shape,
+    #         bwd_shape=tokens_shape,
+    #         fwd_dtype=hidden_states_dtype,
+    #         bwd_dtype=tokens_dtype,
+    #         device=device,
+    #         num_prompt_tokens=num_prompt_tokens,
+    # )
     # setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
+
+    setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
     global comm
     comm = get_comm()
 

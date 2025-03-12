@@ -172,8 +172,10 @@ class TorchP2PComm(P2PComm):
 class IrohRequest(Request):
     def __init__(self, future: Future):
         self.future = future
+        self.logger = get_logger()
 
     def wait(self) -> torch.Tensor:
+        self.logger.debug(f"wait on {self.future=}")
         return self.future.result()
 
 
@@ -196,37 +198,47 @@ class IrohP2PComm(P2PComm):
         self.logger.info(f"Connect to node with: {self.node.get_node_id()}")
 
         # Connect to the remote node
-        server_public_key = input("Please enter the server's public key: ").strip()
-        self.node.connect(server_public_key)
+        while True:
+            try:
+                self.logger.info("Please enter the server's public key: ")
+                self.node.connect(input().strip())
+                break
+            except Exception as e:
+                self.logger.error(f"Error connecting to node: {e}")
+                continue
 
         # Wait for connection to be established
         while not self.node.is_ready():
             time.sleep(1 / 100)
+        self.logger.info("Connected!")
 
-    def send(self, data: torch.Tensor, **kwargs) -> None:
+    def send(self, tensor: torch.Tensor, **kwargs) -> None:
         if self.world.size == 1:
             return
-        serialized_data = self.serializer.serialize(data)
-        self.logger.debug(f"Sending data to node with key: {self.node.get_node_id()}")
+        self.logger.debug(f"send {tensor=}")
+        serialized_data = self.serializer.serialize(tensor)
         self.node.send(serialized_data)
 
     def recv(self, **kwargs) -> torch.Tensor:
         if self.world.size == 1:
             return
         serialized_data = self.node.recv()
-        self.logger.debug(f"Received data from node with key: {self.node.get_node_id()}")
-        return self.serializer.deserialize(serialized_data).to(self.device)
+        tensor = self.serializer.deserialize(serialized_data).to(self.device)
+        self.logger.debug(f"recv {tensor=}")
+        return tensor
 
     def isend(self, tensor: torch.Tensor, **kwargs) -> Optional[Request]:
         if self.world.size == 1:
             return
         future = self.executor.submit(self.send, tensor, **kwargs)
+        self.logger.debug(f"isend {tensor=}")
         return IrohRequest(future)
 
-    def irecv(self, tag: int, shape: tuple[int, ...]) -> Optional[Request]:
+    def irecv(self, **kwargs) -> Optional[Request]:
         if self.world.size == 1:
             return
-        future = self.executor.submit(self.recv, tag, shape)
+        future = self.executor.submit(self.recv, **kwargs)
+        self.logger.debug("irecv")
         return IrohRequest(future)
 
     def destroy(self):
