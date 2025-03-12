@@ -253,8 +253,34 @@ def decode(
         device=device,
     )
 
+    # Single-node
+    if world.size == 1:
+        for token_idx in range(starting_pos, decoded_tokens.size(-1)):
+            input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+            for micro_batch_idx in range(num_micro_batches):
+                start_idx = micro_batch_idx * micro_batch_size
+                end_idx = start_idx + micro_batch_size
+                cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(
+                    -1
+                )
+                logits = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    cur_tokens,
+                    input_pos
+                )
+                next_token = sample(logits, **sampling_kwargs)
+                decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+        logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
+        return
+
+    # Multi-node
+    # Prefill pipeline
+    send_reqs = [None] * num_micro_batches
     recv_reqs = [None] * num_micro_batches
-    if world.rank == 0 and world.size > 1:
+    if world.is_first_stage:
         input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         for micro_batch_idx in range(num_micro_batches):
@@ -270,155 +296,51 @@ def decode(
                 cur_tokens,
                 input_pos,
             )
-            comm.send(hidden_states, tag=micro_batch_idx)
+            send_reqs[micro_batch_idx] = comm.isend(hidden_states, tag=micro_batch_idx)
             recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
-
-    cur_tokens, hidden_states = None, None
+        
+    # Decode interleaved
+    next_token, hidden_states = None, None
     for token_idx in range(starting_pos, decoded_tokens.size(-1)):
         input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         for micro_batch_idx in range(num_micro_batches):
-            if world.size == 1:
+            if world.is_first_stage:
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
-                cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(-1)
-                logits = model_forward(
-                    model,
-                    micro_batch_idx,
-                    mask,
-                    cur_tokens,
-                    input_pos,
-                )
-                next_token = sample(logits, **sampling_kwargs)
+                next_token = recv_reqs[micro_batch_idx].wait()
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
             else:
-                if world.is_first_stage:
-                    # Receive next token, forward, send hidden states forward
-                    next_token = recv_reqs[micro_batch_idx].wait()
-                    start_idx = micro_batch_idx * micro_batch_size
-                    end_idx = start_idx + micro_batch_size
-                    decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
-                    cur_tokens = decoded_tokens[start_idx:end_idx, token_idx].unsqueeze(
-                        -1
-                    )
-                    if token_idx < decoded_tokens.size(-1) - 1:
-                        hidden_states = model_forward(
-                            model,
-                            micro_batch_idx,
-                            mask,
-                            cur_tokens,
-                            input_pos + 1,
-                        )
-                        comm.send(hidden_states, tag=micro_batch_idx)
-                        recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
-                elif world.is_last_stage:
-                    # Receive hidden states, sample, send next token back
-                    hidden_states = comm.recv(tag=micro_batch_idx)
-                    logits = model_forward(
-                        model,
-                        micro_batch_idx,
-                        mask,
-                        cur_tokens,
-                        input_pos,
-                        hidden_states,
-                    )
-                    next_token = sample(logits, **sampling_kwargs)
-                    comm.send(next_token, tag=micro_batch_idx)
-                else:
-                    # Receive hidden states, forward, send hidden states forward
-                    hidden_states = comm.recv(tag=micro_batch_idx)
-                    hidden_states = model_forward(
-                        model,
-                        micro_batch_idx,
-                        mask,
-                        cur_tokens,
-                        input_pos,
-                        hidden_states,
-                    )
-                    comm.send(hidden_states, tag=micro_batch_idx)
+                hidden_states = comm.recv(tag=micro_batch_idx)
+
+            # Skip forward and send on last iteration for first stage
+            if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
+                continue
+
+            # Forward pass
+            outputs = model_forward(
+                model,
+                micro_batch_idx,
+                mask,
+                next_token,
+                input_pos + 1,
+                hidden_states,
+            )
+
+            if world.is_last_stage:
+                outputs = sample(outputs, **sampling_kwargs)
+
+            # Send hidden states or next token
+            send_reqs[micro_batch_idx] = comm.isend(outputs, tag=micro_batch_idx)
+            
+            # Schedule next recv
+            if world.is_first_stage:
+                recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+
+        # Wait for all sends to complete
+        [req.wait() for req in send_reqs]
 
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
-
-    ### TODO: Make asynch communication work
-    # Setup receive buffers
-    # recv_reqs = [None] * num_micro_batches
-    # recv_buffers = [None] * num_micro_batches
-
-    # # Prefill pipeline on first stage
-    # if world.rank == 0 and world.size > 1:
-    #     for micro_batch_idx in range(num_micro_batches):
-    #         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-    #         hidden_states = model_forward(
-    #             model,
-    #             micro_batch_idx,
-    #             mask,
-    #             batched_cur_tokens[micro_batch_idx],
-    #             input_pos,
-    #         )
-    #         send(hidden_states, tag=micro_batch_idx)
-    #         recv_tensor, recv_req = recv(tag=micro_batch_idx)
-    #         recv_reqs[micro_batch_idx] = recv_req
-    #         recv_buffers[micro_batch_idx] = recv_tensor
-    #     input_pos += 1
-
-    # # Decode auto-regressively
-    # batched_decoded_tokens = []  # List[Tensor[batch_size, 1]] of length num_new_tokens
-    # for token_idx in range(num_new_tokens):
-    #     batched_next_tokens = []
-    #     mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-    #     for micro_batch_idx in range(num_micro_batches):
-    #         # Wait for requests
-    #         if world.size == 1:
-    #             logits = model_forward(
-    #                 model,
-    #                 micro_batch_idx,
-    #                 mask,
-    #                 batched_cur_tokens[micro_batch_idx],
-    #                 input_pos,
-    #             )
-    #             next_token = sample(logits, **sampling_kwargs)
-    #             batched_next_tokens.append(next_token)
-    #             batched_cur_tokens[micro_batch_idx] = next_token
-    #         else:
-    #             if world.rank == 0:
-    #                 recv_reqs[micro_batch_idx].wait()
-    #                 next_token = recv_buffers[micro_batch_idx].clone()
-    #                 batched_cur_tokens[micro_batch_idx] = next_token
-    #                 batched_next_tokens.append(next_token)
-
-    #                 if token_idx < num_new_tokens - 1:
-    #                     hidden_states = model_forward(
-    #                         model,
-    #                         micro_batch_idx,
-    #                         mask,
-    #                         batched_cur_tokens[micro_batch_idx],
-    #                         input_pos,
-    #                     )
-    #                     send(hidden_states, tag=micro_batch_idx)
-
-    #                     recv_tensor, recv_req = recv(tag=micro_batch_idx)
-    #                     recv_reqs[micro_batch_idx] = recv_req
-    #                     recv_buffers[micro_batch_idx] = recv_tensor
-    #             else:  # intermediate aand last stage
-    #                 hidden_states, _ = recv(tag=micro_batch_idx)
-    #                 output = model_forward(
-    #                     model,
-    #                     micro_batch_idx,
-    #                     mask,
-    #                     None,
-    #                     input_pos,
-    #                     hidden_states,
-    #                 )
-    #                 next_token = maybe_sample(output, **sampling_kwargs)
-    #                 send_tensor = next_token if next_token is not None else output
-    #                 send(send_tensor, tag=micro_batch_idx)
-
-    #     if world.rank == 0:
-    #         batched_decoded_tokens.append(torch.cat(batched_next_tokens, dim=0))
-    #     input_pos += 1
-
-    # return torch.cat(batched_decoded_tokens, dim=-1) if world.rank == 0 else None
-
 
 @torch.no_grad()
 def generate(

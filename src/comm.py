@@ -96,8 +96,6 @@ class TorchP2PComm(P2PComm):
 
     def _send_fwd(self, send_func: Callable, hidden_states: torch.Tensor, tag: int) -> TorchRequest:
         """Sends hidden states to the next stage"""
-        if self.world.size == 1:
-            return TorchRequest(None, None)
         next_rank = self.world.rank + 1
         assert next_rank < self.world.size
         self.logger.debug(f"send_fwd {hidden_states=} to {next_rank=} with {tag=}")
@@ -106,8 +104,6 @@ class TorchP2PComm(P2PComm):
 
     def _send_bwd(self, send_func: Callable, next_token: torch.Tensor, tag: int) -> TorchRequest:
         """Sends next token to the first stage"""
-        if self.world.size == 1:
-            return TorchRequest(None, None)
         self.logger.debug(
             f"send_bwd {next_token=} to {self.world.first_stage_rank=} with {tag=}"
         )
@@ -116,8 +112,6 @@ class TorchP2PComm(P2PComm):
 
     def _recv_fwd(self, recv_func: Callable, tag: int, shape: tuple[int, ...]) -> TorchRequest:
         """Receives hidden states from the previous stage"""
-        if self.world.size == 1:
-            return TorchRequest(None, None)
         prev_rank = self.world.rank - 1
         assert prev_rank >= 0
         hidden_states = torch.empty(shape, dtype=self.fwd_dtype, device=self.device)
@@ -129,8 +123,6 @@ class TorchP2PComm(P2PComm):
 
     def _recv_bwd(self, recv_func: Callable, tag: int, shape: tuple[int, ...]) -> TorchRequest:
         """Receives next token from the last stage"""
-        if self.world.size == 1:
-            return TorchRequest(None, None)
         next_token = torch.empty(shape, dtype=self.bwd_dtype, device=self.device)
         self.logger.debug(
             f"recv_bwd into {next_token=} from {self.world.last_stage_rank=} with {tag=}"
@@ -141,14 +133,14 @@ class TorchP2PComm(P2PComm):
     def send(self, tensor: torch.Tensor, tag: int) -> None:
         """Sends tensor (hidden states or next token) to the correct next rank"""
         if self.world.size == 1:
-            return
+            return None
         send_fwd_or_bwd = self._send_bwd if self.world.is_last_stage else self._send_fwd
         send_fwd_or_bwd(dist.send, tensor, tag).wait()
 
-    def recv(self, tag: int, prefill: bool = False) -> torch.Tensor:
+    def recv(self, tag: int, prefill: bool = False) -> Optional[torch.Tensor]:
         """Receives tensor (hidden states or next token) from the correct previous rank"""
         if self.world.size == 1:
-            return
+            return None
         shape = (
             (self.bwd_shape, self.bwd_prefill_shape)
             if self.world.is_first_stage
@@ -159,15 +151,11 @@ class TorchP2PComm(P2PComm):
 
     def isend(self, tensor: torch.Tensor, tag: int) -> Request:
         """Sends tensor (hidden states or next token) to the correct next rank"""
-        if self.world.size == 1:
-            return Request(None, None)
         send_fwd_or_bwd = self._send_bwd if self.world.is_last_stage else self._send_fwd
         return send_fwd_or_bwd(dist.isend, tensor, tag)
 
     def irecv(self, tag: int, prefill: bool = False) -> Request:
         """Receives tensor (hidden states or next token) from the correct previous rank"""
-        if self.world.size == 1:
-            return Request(None, None)
         shape = (
             (self.bwd_shape, self.bwd_prefill_shape)
             if self.world.is_first_stage
