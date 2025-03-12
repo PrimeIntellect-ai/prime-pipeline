@@ -12,7 +12,7 @@ from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import IrohP2PComm, P2PComm, get_comm, setup_comm
+from comm import TorchP2PComm, IrohP2PComm, P2PComm, get_comm, setup_comm
 from logger import get_logger, setup_logger
 from model import Transformer
 from serializer import PickleSerializer
@@ -278,7 +278,6 @@ def decode(
 
     # Multi-node
     # Prefill pipeline
-    send_reqs = [None] * num_micro_batches
     recv_reqs = [None] * num_micro_batches
     if world.is_first_stage:
         input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
@@ -310,6 +309,7 @@ def decode(
                 end_idx = start_idx + micro_batch_size
                 next_token = recv_reqs[micro_batch_idx].wait()
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+                input_pos += 1
             else:
                 hidden_states = comm.recv(tag=micro_batch_idx)
 
@@ -318,12 +318,13 @@ def decode(
                 continue
 
             # Forward pass
+            logger.debug(f"Forward pass for token {input_pos}")
             outputs = model_forward(
                 model,
                 micro_batch_idx,
                 mask,
                 next_token,
-                input_pos + 1,
+                input_pos,
                 hidden_states,
             )
 
@@ -460,22 +461,25 @@ def main(args: argparse.Namespace) -> None:
         if args.batch_size >= world.size
         else 1
     )
-    # num_prompt_tokens = prompt_tokens.size(-1)
-    # hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    # tokens_shape = (micro_batch_size, 1)
-    # hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
-    # tokens_dtype = torch.long
-    # setup_comm(TorchP2PComm, 
-    #         fwd_shape=hidden_states_shape,
-    #         bwd_shape=tokens_shape,
-    #         fwd_dtype=hidden_states_dtype,
-    #         bwd_dtype=tokens_dtype,
-    #         device=device,
-    #         num_prompt_tokens=num_prompt_tokens,
-    # )
-    # setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
+    num_prompt_tokens = prompt_tokens.size(-1)
+    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
+    tokens_shape = (micro_batch_size, 1)
+    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
+    tokens_dtype = torch.long
+    if args.backend == "torch":
+        setup_comm(TorchP2PComm, 
+                fwd_shape=hidden_states_shape,
+                bwd_shape=tokens_shape,
+                fwd_dtype=hidden_states_dtype,
+                bwd_dtype=tokens_dtype,
+                device=device,
+                num_prompt_tokens=num_prompt_tokens,
+        )
+    elif args.backend == "iroh":
+        setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
+    else:
+        raise ValueError(f"Invalid backend: {args.backend}")
 
-    setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
     global comm
     comm = get_comm()
 
@@ -587,7 +591,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default=None,
-        help="Backend to use for the model. If not provided, will use nccl if device is cuda, otherwise gloo.",
+        default="torch",
+        help="Either `torch` or `iroh`.",
     )
     main(parser.parse_args())

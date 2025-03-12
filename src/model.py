@@ -4,8 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
+import time
 from dataclasses import dataclass
 from typing import Optional
+from time import perf_counter
 
 import torch
 import torch.nn as nn
@@ -17,6 +19,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
+from logger import get_logger
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -227,6 +230,7 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.get_mask_mod = get_mask_mod
+        self.logger = get_logger()
 
     def setup_caches(self, num_micro_batches, max_micro_batch_size, max_seq_length):
         if (
@@ -271,6 +275,7 @@ class Transformer(nn.Module):
         hidden_states: Optional[Tensor] = None,
     ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
+        t0 = perf_counter()
         mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
 
@@ -285,6 +290,7 @@ class Transformer(nn.Module):
             x = layer(micro_batch_idx, x, input_pos, freqs_cis, mask)
         x = self.norm(x)
         logits = self.output(x)
+        self.logger.debug(f"Forward pass took {(perf_counter() - t0) * 1000:.2f}ms")
         return logits
 
     @classmethod
