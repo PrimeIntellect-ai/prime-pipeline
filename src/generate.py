@@ -36,12 +36,12 @@ world: Optional[World] = None
 
 
 def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
-    """Sample from a multinomial distribution without a cuda synchronization from (B, S) to (B)"""
+    """Sample from a multinomial distribution without a cuda synchronization from (B, S) to (B, 1)"""
     # Draw exponential random variables
     q = torch.empty_like(probs_sort).exponential_(1)
 
     # Select the argmax
-    next_tokens = torch.argmax(probs_sort / q, dim=-1, keepdim=False).to(
+    next_tokens = torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(
         dtype=torch.long
     )
 
@@ -172,8 +172,7 @@ def prefill(
     for micro_batch_idx in range(num_micro_batches):
         # Receive hidden states from previous stage
         if not world.is_first_stage:
-            recv_req = comm.irecv(tag=micro_batch_idx, prefill=True)
-            hidden_states = recv_req.wait()
+            hidden_states = comm.recv(tag=micro_batch_idx, prefill=True)
 
         # Get micro-batch prompt tokens
         start_idx = micro_batch_idx * micro_batch_size
@@ -195,17 +194,15 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        send_req = comm.isend(outputs, tag=micro_batch_idx)
-        send_req.wait()
+        comm.send(outputs, tag=micro_batch_idx)
 
         if world.is_first_stage:
             # Receive next token from last stage
             if world.size == 1:
                 next_token = outputs
             else:
-                recv_req = comm.irecv(tag=micro_batch_idx, prefill=True)
-                next_token = recv_req.wait()
-            decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token
+                next_token = comm.recv(tag=micro_batch_idx, prefill=True)
+            decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
 
     logger.debug(f"Prefilled tokens {decoded_tokens[:, num_prompt_tokens]=}")
 
@@ -256,50 +253,89 @@ def decode(
         device=device,
     )
 
-    cur_tokens, hidden_states = None, None
-    for token_idx in range(starting_pos, decoded_tokens.size(-1)):
-        input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
+    recv_reqs = [None] * num_micro_batches
+    if world.rank == 0 and world.size > 1:
+        input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         for micro_batch_idx in range(num_micro_batches):
-            # Receive hidden states from previous stage
-            if not world.is_first_stage:
-                req = comm.irecv(tag=micro_batch_idx)
-                hidden_states = req.wait()
-            else:
-                start_idx = micro_batch_idx * micro_batch_size
-                end_idx = start_idx + micro_batch_size
-                cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(
-                    -1
-                )
-
-            # Forward pass
-            outputs = model_forward(
+            start_idx = micro_batch_idx * micro_batch_size
+            end_idx = start_idx + micro_batch_size
+            cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(
+                -1
+            )
+            hidden_states = model_forward(
                 model,
                 micro_batch_idx,
                 mask,
                 cur_tokens,
                 input_pos,
-                hidden_states,
             )
+            comm.send(hidden_states, tag=micro_batch_idx)
+            recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
 
-            # Sample next token
-            if world.is_last_stage:
-                outputs = sample(outputs, **sampling_kwargs)
-
-            # Send hidden states or next token to next stage
-            send_req = comm.isend(outputs, tag=micro_batch_idx)
-            send_req.wait()
-
-            if world.is_first_stage:
-                # Receive next token from last stage
-                if world.size == 1:
-                    next_token = outputs
+    cur_tokens, hidden_states = None, None
+    for token_idx in range(starting_pos, decoded_tokens.size(-1)):
+        input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
+        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+        for micro_batch_idx in range(num_micro_batches):
+            if world.size == 1:
+                start_idx = micro_batch_idx * micro_batch_size
+                end_idx = start_idx + micro_batch_size
+                cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(-1)
+                logits = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    cur_tokens,
+                    input_pos,
+                )
+                next_token = sample(logits, **sampling_kwargs)
+                decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+            else:
+                if world.is_first_stage:
+                    # Receive next token, forward, send hidden states forward
+                    next_token = recv_reqs[micro_batch_idx].wait()
+                    start_idx = micro_batch_idx * micro_batch_size
+                    end_idx = start_idx + micro_batch_size
+                    decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+                    cur_tokens = decoded_tokens[start_idx:end_idx, token_idx].unsqueeze(
+                        -1
+                    )
+                    if token_idx < decoded_tokens.size(-1) - 1:
+                        hidden_states = model_forward(
+                            model,
+                            micro_batch_idx,
+                            mask,
+                            cur_tokens,
+                            input_pos + 1,
+                        )
+                        comm.send(hidden_states, tag=micro_batch_idx)
+                        recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+                elif world.is_last_stage:
+                    # Receive hidden states, sample, send next token back
+                    hidden_states = comm.recv(tag=micro_batch_idx)
+                    logits = model_forward(
+                        model,
+                        micro_batch_idx,
+                        mask,
+                        cur_tokens,
+                        input_pos,
+                        hidden_states,
+                    )
+                    next_token = sample(logits, **sampling_kwargs)
+                    comm.send(next_token, tag=micro_batch_idx)
                 else:
-                    req = comm.irecv(tag=micro_batch_idx)
-                    next_token = req.wait()
-
-                # Fill tokens
-                decoded_tokens[start_idx:end_idx, input_pos] = next_token
+                    # Receive hidden states, forward, send hidden states forward
+                    hidden_states = comm.recv(tag=micro_batch_idx)
+                    hidden_states = model_forward(
+                        model,
+                        micro_batch_idx,
+                        mask,
+                        cur_tokens,
+                        input_pos,
+                        hidden_states,
+                    )
+                    comm.send(hidden_states, tag=micro_batch_idx)
 
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
 
@@ -404,13 +440,6 @@ def generate(
     """
     # Setup model cache
     batch_size, num_prompt_tokens = prompt_tokens.shape
-    micro_batch_size = (
-        micro_batch_size
-        if micro_batch_size is not None
-        else batch_size // world.size
-        if batch_size >= world.size
-        else 1
-    )
     num_micro_batches = batch_size // micro_batch_size
     num_total_tokens = min(num_prompt_tokens + num_new_tokens, model.config.block_size)
     device = model.layers[0].feed_forward.w1.weight.device
@@ -597,7 +626,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size.")
     parser.add_argument(
         "--micro-batch-size",
-        type=Optional[int],
+        type=int,
         default=None,
         help="Number of micro-batches. If not provided, will use world.size if batch_size >= world.size else 1.",
     )
