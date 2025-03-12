@@ -1,7 +1,8 @@
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Type
+from typing import Callable, Optional, Type, Union
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import torch
 import torch.distributed as dist
@@ -11,23 +12,34 @@ from logger import get_logger
 from serializer import Serializer
 from world import get_world
 
+class Request(ABC):
+    @abstractmethod
+    def wait(self) -> Optional[torch.Tensor]:
+        pass
 
 class P2PComm(ABC):
     def __init__(self):
         self.world = get_world()
 
     @abstractmethod
-    def send(self, data: bytes):
+    def send(self, data: torch.Tensor) -> None:
         pass
 
     @abstractmethod
-    def recv(self) -> bytes:
+    def recv(self) -> torch.Tensor:
+        pass
+
+    @abstractmethod
+    def isend(self, tensor: torch.Tensor) -> Request:
+        pass
+
+    @abstractmethod
+    def irecv(self, tag: int, shape: tuple[int, ...]) -> Request:
         pass
 
     @abstractmethod
     def destroy(self):
         pass
-
 
 _COMM: Optional[P2PComm] = None
 
@@ -42,6 +54,16 @@ def get_comm() -> P2PComm:
     global _COMM
     assert _COMM is not None, "Comm not setup"
     return _COMM
+
+class TorchRequest(Request):
+    def __init__(self, tensor: torch.Tensor, work: Union[None, int, dist.Work]):
+        self.tensor = tensor
+        self.work = work
+
+    def wait(self) -> Optional[torch.Tensor]:
+        if isinstance(self.work, dist.Work):
+            self.work.wait()
+        return self.tensor
 
 
 class TorchP2PComm(P2PComm):
@@ -72,21 +94,23 @@ class TorchP2PComm(P2PComm):
             init_method=init_method, backend=backend
         )
 
-    def _send_fwd(self, hidden_states: torch.Tensor, tag: int) -> None:
+    def _send_fwd(self, send_func: Callable, hidden_states: torch.Tensor, tag: int) -> Request:
         """Sends hidden states to the next stage"""
         next_rank = self.world.rank + 1
         assert next_rank < self.world.size
         self.logger.debug(f"send_fwd {hidden_states=} to {next_rank=} with {tag=}")
-        dist.send(hidden_states, dst=next_rank, tag=tag)
+        send_req = send_func(hidden_states, dst=next_rank, tag=tag)
+        return TorchRequest(None, send_req)
 
-    def _send_bwd(self, next_token: torch.Tensor, tag: int) -> None:
+    def _send_bwd(self, send_func: Callable, next_token: torch.Tensor, tag: int) -> Request:
         """Sends next token to the first stage"""
         self.logger.debug(
             f"send_bwd {next_token=} to {self.world.first_stage_rank=} with {tag=}"
         )
-        dist.send(next_token, dst=self.world.first_stage_rank, tag=tag)
+        send_req = send_func(next_token, dst=self.world.first_stage_rank, tag=tag)
+        return TorchRequest(None, send_req)
 
-    def _recv_fwd(self, tag: int, shape: tuple[int, ...]) -> torch.Tensor:
+    def _recv_fwd(self, recv_func: Callable, tag: int, shape: tuple[int, ...]) -> Request:
         """Receives hidden states from the previous stage"""
         prev_rank = self.world.rank - 1
         assert prev_rank >= 0
@@ -94,42 +118,69 @@ class TorchP2PComm(P2PComm):
         self.logger.debug(
             f"recv_fwd into {hidden_states=} from {prev_rank=} with {tag=}"
         )
-        dist.recv(hidden_states, src=prev_rank, tag=tag)
+        recv_req = recv_func(hidden_states, src=prev_rank, tag=tag)
         self.logger.debug(f"recv_fwd done {hidden_states=}")
-        return hidden_states
+        return TorchRequest(hidden_states, recv_req)
 
-    def _recv_bwd(self, tag: int, shape: tuple[int, ...]) -> torch.Tensor:
+    def _recv_bwd(self, recv_func: Callable, tag: int, shape: tuple[int, ...]) -> TorchRequest:
         """Receives next token from the last stage"""
         next_token = torch.empty(shape, dtype=self.bwd_dtype, device=self.device)
         self.logger.debug(
             f"recv_bwd into {next_token=} from {self.world.last_stage_rank=} with {tag=}"
         )
-        dist.recv(next_token, src=self.world.last_stage_rank, tag=tag)
+        recv_req = recv_func(next_token, src=self.world.last_stage_rank, tag=tag)
         self.logger.debug(f"recv_bwd done {next_token=}")
-        return next_token
+        return TorchRequest(next_token, recv_req)
 
     def send(self, tensor: torch.Tensor, tag: int) -> None:
         """Sends tensor (hidden states or next token) to the correct next rank"""
         if self.world.size == 1:
-            return None
-        _send = self._send_bwd if self.world.is_last_stage else self._send_fwd
-        _send(tensor, tag)
+            return
+        send_fwd_or_bwd = self._send_bwd if self.world.is_last_stage else self._send_fwd
+        send_fwd_or_bwd(dist.send, tensor, tag).wait()
 
     def recv(self, tag: int, prefill: bool = False) -> torch.Tensor:
         """Receives tensor (hidden states or next token) from the correct previous rank"""
         if self.world.size == 1:
-            return None
+            return
         shape = (
             (self.bwd_shape, self.bwd_prefill_shape)
             if self.world.is_first_stage
             else (self.fwd_shape, self.fwd_prefill_shape)
         )
-        _recv = self._recv_bwd if self.world.is_first_stage else self._recv_fwd
-        return _recv(tag, shape[int(prefill)])
+        recv_fwd_or_bwd = self._recv_bwd if self.world.is_first_stage else self._recv_fwd
+        return recv_fwd_or_bwd(dist.recv, tag, shape[int(prefill)]).wait()
+
+    def isend(self, tensor: torch.Tensor, tag: int) -> Request:
+        """Sends tensor (hidden states or next token) to the correct next rank"""
+        if self.world.size == 1:
+            return
+        send_fwd_or_bwd = self._send_bwd if self.world.is_last_stage else self._send_fwd
+        return send_fwd_or_bwd(dist.isend, tensor, tag)
+
+    def irecv(self, tag: int, prefill: bool = False) -> Request:
+        """Receives tensor (hidden states or next token) from the correct previous rank"""
+        if self.world.size == 1:
+            return
+        shape = (
+            (self.bwd_shape, self.bwd_prefill_shape)
+            if self.world.is_first_stage
+            else (self.fwd_shape, self.fwd_prefill_shape)
+        )
+        recv_fwd_or_bwd = self._recv_bwd if self.world.is_first_stage else self._recv_fwd
+        return recv_fwd_or_bwd(dist.irecv, tag, shape[int(prefill)])
 
     def destroy(self):
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+class IrohRequest(Request):
+    def __init__(self, future: Future):
+        self.future = future
+
+    def wait(self) -> torch.Tensor:
+        return self.future.result()
 
 
 class IrohP2PComm(P2PComm):
@@ -139,17 +190,19 @@ class IrohP2PComm(P2PComm):
         self.device = device
         self.logger = get_logger()
         self.node = None
+        self.executor = ThreadPoolExecutor(max_workers=2) # one for sending, one for receiving
 
         if self.world.size <= 1:
             return
+        self._setup_iroh()
 
+    def _setup_iroh(self):
         # Create iroh node
         self.node = create_connector()
         self.logger.info(f"Connect to node with: {self.node.get_node_id()}")
 
         # Connect to the remote node
         server_public_key = input("Please enter the server's public key: ").strip()
-        self.logger.info(f"Connecting to node with key: {server_public_key}")
         self.node.connect(server_public_key)
 
         # Wait for connection to be established
@@ -158,18 +211,31 @@ class IrohP2PComm(P2PComm):
 
     def send(self, data: torch.Tensor, **kwargs) -> None:
         if self.world.size == 1:
-            return None
+            return
         serialized_data = self.serializer.serialize(data)
-        self.logger.info(f"Sending data to node with key: {self.node.get_node_id()}")
+        self.logger.debug(f"Sending data to node with key: {self.node.get_node_id()}")
         self.node.send(serialized_data)
 
     def recv(self, **kwargs) -> torch.Tensor:
         if self.world.size == 1:
-            return None
+            return
         serialized_data = self.node.recv()
-        self.logger.info(f"Received data from node with key: {self.node.get_node_id()}")
+        self.logger.debug(f"Received data from node with key: {self.node.get_node_id()}")
         return self.serializer.deserialize(serialized_data).to(self.device)
+
+    def isend(self, tensor: torch.Tensor, **kwargs) -> Optional[Request]:
+        if self.world.size == 1:
+            return
+        future = self.executor.submit(self.send, tensor, **kwargs)
+        return IrohRequest(future)
+
+    def irecv(self, tag: int, shape: tuple[int, ...]) -> Optional[Request]:
+        if self.world.size == 1:
+            return
+        future = self.executor.submit(self.recv, tag, shape)
+        return IrohRequest(future)
 
     def destroy(self):
         if self.node is not None:
+            self.executor.shutdown()
             self.node.shutdown()

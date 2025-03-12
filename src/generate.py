@@ -12,7 +12,7 @@ from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import IrohP2PComm, P2PComm, get_comm, setup_comm
+from comm import IrohP2PComm, P2PComm, get_comm, setup_comm, TorchP2PComm
 from logger import get_logger, setup_logger
 from model import Transformer
 from serializer import PickleSerializer
@@ -172,7 +172,8 @@ def prefill(
     for micro_batch_idx in range(num_micro_batches):
         # Receive hidden states from previous stage
         if not world.is_first_stage:
-            hidden_states = comm.recv(tag=micro_batch_idx, prefill=True)
+            recv_req = comm.irecv(tag=micro_batch_idx, prefill=True)
+            hidden_states = recv_req.wait()
 
         # Get micro-batch prompt tokens
         start_idx = micro_batch_idx * micro_batch_size
@@ -194,14 +195,16 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        comm.send(outputs, tag=micro_batch_idx)
+        send_req = comm.isend(outputs, tag=micro_batch_idx)
+        send_req.wait()
 
         if world.is_first_stage:
             # Receive next token from last stage
             if world.size == 1:
                 next_token = outputs
             else:
-                next_token = comm.recv(tag=micro_batch_idx, prefill=True)
+                recv_req = comm.irecv(tag=micro_batch_idx, prefill=True)
+                next_token = recv_req.wait()
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token
 
     logger.debug(f"Prefilled tokens {decoded_tokens[:, num_prompt_tokens]=}")
@@ -260,7 +263,8 @@ def decode(
         for micro_batch_idx in range(num_micro_batches):
             # Receive hidden states from previous stage
             if not world.is_first_stage:
-                hidden_states = comm.recv(tag=micro_batch_idx)
+                req = comm.irecv(tag=micro_batch_idx)
+                hidden_states = req.wait()
             else:
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
@@ -283,14 +287,16 @@ def decode(
                 outputs = sample(outputs, **sampling_kwargs)
 
             # Send hidden states or next token to next stage
-            comm.send(outputs, tag=micro_batch_idx)
+            send_req = comm.isend(outputs, tag=micro_batch_idx)
+            send_req.wait()
 
             if world.is_first_stage:
                 # Receive next token from last stage
                 if world.size == 1:
                     next_token = outputs
                 else:
-                    next_token = comm.recv(tag=micro_batch_idx)
+                    req = comm.irecv(tag=micro_batch_idx)
+                    next_token = req.wait()
 
                 # Fill tokens
                 decoded_tokens[start_idx:end_idx, input_pos] = next_token
@@ -505,11 +511,20 @@ def main(args: argparse.Namespace) -> None:
         if args.batch_size >= world.size
         else 1
     )
-    # hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    # tokens_shape = (micro_batch_size, 1)
-    # hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
-    # tokens_dtype = torch.long
-    setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
+    num_prompt_tokens = prompt_tokens.size(-1)
+    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
+    tokens_shape = (micro_batch_size, 1)
+    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
+    tokens_dtype = torch.long
+    setup_comm(TorchP2PComm, 
+            fwd_shape=hidden_states_shape,
+            bwd_shape=tokens_shape,
+            fwd_dtype=hidden_states_dtype,
+            bwd_dtype=tokens_dtype,
+            device=device,
+            num_prompt_tokens=num_prompt_tokens,
+    )
+    # setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
     global comm
     comm = get_comm()
 
