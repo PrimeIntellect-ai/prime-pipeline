@@ -1,6 +1,8 @@
 # From: https://github.com/pytorch-labs/gpt-fast/blob/main/generate.py
+import pickle
 import argparse
 import time
+import asyncio
 from pathlib import Path
 from typing import Any, Optional
 
@@ -121,7 +123,7 @@ def adjust_mask_and_model_forward(
     )
 
 
-def prefill(
+async def prefill(
     model: Transformer,
     decoded_tokens: Tensor,
     micro_batch_size: int,
@@ -165,6 +167,7 @@ def prefill(
         device=decoded_tokens.device,
     )
 
+    device = decoded_tokens.device
     batch_size = decoded_tokens.size(0)
     num_prompt_tokens = input_pos.size(0)
     num_micro_batches = batch_size // micro_batch_size
@@ -172,7 +175,7 @@ def prefill(
     for micro_batch_idx in range(num_micro_batches):
         # Receive hidden states from previous stage
         if not world.is_first_stage:
-            hidden_states = comm.recv(tag=micro_batch_idx, prefill=True)
+            hidden_states = pickle.loads(await comm.recv()).to(device)
 
         # Get micro-batch prompt tokens
         start_idx = micro_batch_idx * micro_batch_size
@@ -194,20 +197,20 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        comm.send(outputs, tag=micro_batch_idx)
+        await comm.send(pickle.dumps(outputs))
 
         if world.is_first_stage:
             # Receive next token from last stage
             if world.size == 1:
                 next_token = outputs
             else:
-                next_token = comm.recv(tag=micro_batch_idx, prefill=True)
+                next_token = pickle.loads(await comm.recv()).to(device)
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
 
     logger.debug(f"Prefilled tokens {decoded_tokens[:, num_prompt_tokens]=}")
 
 
-def decode(
+async def decode(
     model: Transformer,
     decoded_tokens: Tensor,
     num_prompt_tokens: int,
@@ -295,8 +298,8 @@ def decode(
                 cur_tokens,
                 input_pos,
             )
-            comm.send(hidden_states, tag=micro_batch_idx)
-            recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+            await comm.send(pickle.dumps(hidden_states))
+            recv_reqs[micro_batch_idx] = comm.recv()
         
     # Decode interleaved
     next_token, hidden_states = None, None
@@ -307,11 +310,11 @@ def decode(
             if world.is_first_stage:
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
-                next_token = recv_reqs[micro_batch_idx].wait()
+                next_token = pickle.loads(await recv_reqs[micro_batch_idx]).to(device)
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 input_pos += 1
             else:
-                hidden_states = comm.recv(tag=micro_batch_idx)
+                hidden_states = pickle.loads(await comm.recv()).to(device)
 
             # Skip forward and send on last iteration for first stage
             if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
@@ -332,11 +335,11 @@ def decode(
                 outputs = sample(outputs, **sampling_kwargs)
 
             # Send hidden states or next token
-            comm.send(outputs, tag=micro_batch_idx)
+            await comm.send(pickle.dumps(outputs))
             
             # Schedule next recv
             if world.is_first_stage:
-                recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+                recv_reqs[micro_batch_idx] = comm.recv()
 
 
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
@@ -378,22 +381,22 @@ def generate(
     decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
 
     # Prefill prompt tokens
-    prefill(
+    asyncio.run(prefill(
         model=model,
         decoded_tokens=decoded_tokens,
         micro_batch_size=micro_batch_size,
         num_prompt_tokens=num_prompt_tokens,
         **sampling_kwargs,
-    )
+    ))
 
     # Decode remaining tokens
-    decode(
+    asyncio.run(decode(
         model=model,
         decoded_tokens=decoded_tokens,
         micro_batch_size=micro_batch_size,
         num_prompt_tokens=num_prompt_tokens,
         **sampling_kwargs,
-    )
+    ))
 
     return decoded_tokens
 
@@ -462,26 +465,35 @@ def main(args: argparse.Namespace) -> None:
         else 1
     )
     num_prompt_tokens = prompt_tokens.size(-1)
-    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    tokens_shape = (micro_batch_size, 1)
-    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
-    tokens_dtype = torch.long
-    if args.backend == "torch":
-        setup_comm(TorchP2PComm, 
-                fwd_shape=hidden_states_shape,
-                bwd_shape=tokens_shape,
-                fwd_dtype=hidden_states_dtype,
-                bwd_dtype=tokens_dtype,
-                device=device,
-                num_prompt_tokens=num_prompt_tokens,
-        )
-    elif args.backend == "iroh":
-        setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
+    # hidden_states_shape = (micro_batch_size, 1, model.config.dim)
+    # tokens_shape = (micro_batch_size, 1)
+    # hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
+    # tokens_dtype = torch.long
+    # if args.backend == "torch":
+    #     setup_comm(TorchP2PComm, 
+    #             fwd_shape=hidden_states_shape,
+    #             bwd_shape=tokens_shape,
+    #             fwd_dtype=hidden_states_dtype,
+    #             bwd_dtype=tokens_dtype,
+    #             device=device,
+    #             num_prompt_tokens=num_prompt_tokens,
+    #     )
+    # elif args.backend == "iroh":
+    #     setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
+    # else:
+    #     raise ValueError(f"Invalid backend: {args.backend}")
 
     global comm
-    comm = get_comm()
+    from iroh_py import create_node
+    comm = create_node()
+    node_id = comm.get_node_id()
+    logger.info(f"Connect to: {node_id}")
+    peer_id = input().strip()
+    time.sleep(1)
+    comm.connect(peer_id)
+    while not comm.is_ready():
+        time.sleep(0.1)
+    logger.info(f"Connected to: {peer_id}")
 
     start = -1 if args.compile else 0
     metrics = {"latency": [], "tps": []}
@@ -532,7 +544,7 @@ def main(args: argparse.Namespace) -> None:
         logger.info(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
     # Destroy communication
-    comm.destroy()
+    comm.shutdown()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,156 @@ use tokio::runtime::Runtime;
 // ALPN protocol identifier
 const ALPN: &[u8] = b"iroh-py/0";
 
+#[pyclass]
+struct IrohNode {
+    runtime: Runtime,
+    endpoint: Option<Endpoint>,
+    router: Option<Router>,
+    node_id: String,
+    recv_connection: Arc<Mutex<Option<Connection>>>,
+    send_connection: Arc<Mutex<Option<Connection>>>,
+}
+
+/// Create an Iroh node for peer-to-peer communication
+#[pyfunction]
+fn create_node() -> PyResult<IrohNode> {
+    // Create a new Tokio runtime
+    let runtime = Runtime::new()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create Tokio runtime: {}", e)))?;
+
+    let recv_connection = Arc::new(Mutex::new(None));
+    let conn_clone = Arc::clone(&recv_connection);
+    
+    let (endpoint, router, node_id) = runtime.block_on(async {
+        let endpoint = Endpoint::builder().discovery_n0().bind().await
+            .map_err(|e| format!("Failed to bind endpoint: {}", e))?;
+        
+        // Set up server functionality
+        let router = Router::builder(endpoint.clone())
+            .accept(ALPN, IrohReceiverHandler::new(conn_clone))
+            .spawn()
+            .await
+            .map_err(|e| format!("Failed to spawn router: {}", e))?;
+
+        let node_addr = router.endpoint().node_addr().await
+            .map_err(|e| format!("Failed to get node address: {}", e))?;
+        
+        let node_id = node_addr.node_id.to_string();
+        
+        Ok::<_, String>((endpoint, router, node_id))
+    })
+    .map_err(|e| PyRuntimeError::new_err(e))?;
+
+    
+    Ok(IrohNode { 
+        runtime,
+        endpoint: Some(endpoint),
+        router: Some(router),
+        node_id,
+        recv_connection,
+        send_connection: Arc::new(Mutex::new(None)),
+    })
+}
+
+#[pymethods]
+impl IrohNode {
+    /// Get the node ID
+    fn get_node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// Connect to a remote node
+    fn connect(&self, public_key_str: &str) -> PyResult<()> {
+        let endpoint = match &self.endpoint {
+            Some(ep) => ep,
+            None => return Err(PyRuntimeError::new_err("Endpoint not initialized.")),
+        };
+
+        // Parse the public key
+        let pk_bytes = hex::decode(public_key_str)
+            .map_err(|e| PyRuntimeError::new_err(format!("Invalid hex string: {}", e)))?;
+        
+        if pk_bytes.len() != 32 {
+            return Err(PyRuntimeError::new_err(format!("Expected a 32-byte public key, got {} bytes", pk_bytes.len())));
+        }
+        
+        let mut pk_array = [0u8; 32];
+        pk_array.copy_from_slice(&pk_bytes);
+        
+        let public_key = PublicKey::from_bytes(&pk_array)
+            .map_err(|e| PyRuntimeError::new_err(format!("Invalid public key: {}", e)))?;
+        
+        let node_addr = NodeAddr::new(public_key);
+        
+        // Connect to the remote node
+        let connection = self.runtime.block_on(async {
+            endpoint.connect(node_addr, ALPN).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("Connection failed: {}", e)))?;
+        
+        // Store the connection
+        *self.send_connection.lock().unwrap() = Some(connection);
+        
+        Ok(())
+    }
+    
+    /// Check if the node is ready to send and receive data
+    fn is_ready(&self) -> bool {
+        let can_send = self.send_connection.lock().unwrap().is_some();
+        let can_recv = self.recv_connection.lock().unwrap().is_some();
+        can_send && can_recv
+    }
+    
+    /// Send data to the connected peer
+    fn send<'p>(&self, py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyAny>> {
+        let conn = {
+            let lock = self.send_connection.lock().unwrap();
+            match &*lock {
+                Some(conn) => conn.clone(),
+                None => return Err(PyRuntimeError::new_err("No connection established")),
+            }
+        };
+        
+        let data = data.to_vec();
+        
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut send = conn.open_uni().await.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            send.write_all(&data).await.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            send.finish().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            send.stopped().await.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn recv<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let conn = {
+            let lock = self.recv_connection.lock().unwrap();
+            match &*lock {
+                Some(conn) => conn.clone(),
+                None => return Err(PyRuntimeError::new_err("No connection established")),
+            }
+        };
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut recv = conn.accept_uni().await.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let data = recv.read_to_end(usize::MAX).await.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(data)
+        })
+    }
+    
+    /// Shutdown the node
+    fn shutdown(&self) -> PyResult<()> {
+        if let Some(router) = &self.router {
+            self.runtime.block_on(async {
+                router.shutdown().await
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to shutdown: {}", e)))?;
+        }
+        
+        Ok(())
+    }
+}
+
 /// Handler for incoming connections
 #[derive(Clone, Debug)]
 struct IrohReceiverHandler {
@@ -257,7 +407,9 @@ fn iroh_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wait_for, m)?)?;
     m.add_function(wrap_pyfunction!(create_sender, m)?)?;
     m.add_function(wrap_pyfunction!(create_receiver, m)?)?;
+    m.add_function(wrap_pyfunction!(create_node, m)?)?;
     m.add_class::<IrohSender>()?;
     m.add_class::<IrohReceiver>()?;
+    m.add_class::<IrohNode>()?;
     Ok(())
 }
