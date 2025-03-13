@@ -1,44 +1,85 @@
 import os
 import time
+import pytest
 import asyncio
 from iroh_py import create_sender, create_receiver
 from multiprocessing import Process, Queue, Pipe, Event
 from multiprocessing.connection import Connection
-from typing import Optional, Any
+
+@pytest.mark.skip(reason="Debugging")
+def test_async_sender_receiver():
+    async def run_receiver(q: Queue):
+        print(f"Running receiver in {os.getpid()} (p: {os.getppid()})")
+        receiver = create_receiver()
+        node_id = receiver.get_node_id()
+        q.put(node_id)
+        print(f"Listening on: {node_id}")
+        while not receiver.is_ready():
+            time.sleep(0.01)
+        print("Receiver ready")
+        data = await receiver.recv()
+        print(f"Received: {data}")
+        assert data == b"hello"
+        receiver.shutdown()
+
+    async def run_sender(q: Queue):
+        print(f"Running sender in {os.getpid()} (p: {os.getppid()})")
+        sender = create_sender()
+        peer_id = q.get()
+        time.sleep(1) # TODO
+        print(f"Connecting to: {peer_id}")
+        sender.connect(peer_id)
+        while not sender.is_ready():
+            time.sleep(0.01)
+        print("Sender ready")
+        await sender.send(b"hello")
+        sender.shutdown()
+
+    print(f"Running test on {os.getpid()}")
+
+    def run_async(func, q: Queue):
+        asyncio.run(func(q))
+
+    queue = Queue()
+    receiver = Process(target=run_async, args=(run_receiver, queue,))
+    sender = Process(target=run_async, args=(run_sender, queue,))
+    receiver.start()
+    sender.start()
+    receiver.join()
+    sender.join()
 
 class IrohFuture:
-    """
-    A simple Future-like object for non-blocking operations.
-    """
-    def __init__(self, queue: Queue):
-        self.queue = queue
-        self.result = None
-        self._ready = False
-        
-    def wait(self):
-        """Block until the result is available and return it."""
-        if not self._ready:
-            self.result = self.queue.get()
-            self._ready = True
-        return self.result
-        
-    def ready(self) -> bool:
-        """Check if the result is ready without blocking."""
-        if self._ready:
-            return True
-            
-        if not self.queue.empty():
-            try:
-                self.result = self.queue.get_nowait()
-                self._ready = True
-                return True
-            except:
-                pass
-                
-        return False
+     """
+     A simple Future-like object for non-blocking operations.
+     """
+     def __init__(self, queue: Queue):
+         self.queue = queue
+         self.result = None
+         self._ready = False
+         
+     def wait(self):
+         """Block until the result is available and return it."""
+         if not self._ready:
+             self.result = self.queue.get()
+             self._ready = True
+         return self.result
+         
+     def ready(self) -> bool:
+         """Check if the result is ready without blocking."""
+         if self._ready:
+             return True
+             
+         if not self.queue.empty():
+             try:
+                 self.result = self.queue.get_nowait()
+                 self._ready = True
+                 return True
+             except:
+                 pass
+                 
+         return False
 
-
-class AsyncIrohNode:
+class IrohNode:
     """IrohNode running receiver and sender in separate processes with non-blocking API"""
     def __init__(self):
         # Queues for communication
@@ -246,7 +287,7 @@ def test_async_iroh_node():
     """Example test function for the AsyncIrohNode."""
     def run_node(conn: Connection, rank: int):
         print(f"Running node {rank} in {os.getpid()}")
-        node = AsyncIrohNode()
+        node = IrohNode()
         node_id = node.get_node_id()
         conn.send(node_id)
         peer_id = conn.recv()
@@ -291,7 +332,3 @@ def test_async_iroh_node():
     node2.start()
     node1.join()
     node2.join()
-
-
-if __name__ == "__main__":
-    test_async_iroh_node()
