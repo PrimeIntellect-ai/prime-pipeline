@@ -297,11 +297,8 @@ async def decode(
     # Multi-node
     # Prefill pipeline
     recv_reqs = [None] * num_micro_batches
-    serialize_times = []
-    recv_times = []
-    send_times = []
-    forward_times = []
     if world.is_first_stage:
+        logger.debug("Warming up pipeline")
         send_tasks = []
         with timer("Create input pos"):
             input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
@@ -433,6 +430,7 @@ def generate(
     ))
 
     # Decode remaining tokens
+    decode_start = perf_counter()
     asyncio.run(decode(
         model=model,
         decoded_tokens=decoded_tokens,
@@ -441,7 +439,7 @@ def generate(
         **sampling_kwargs,
     ))
 
-    return decoded_tokens
+    return decoded_tokens, decode_start
 
 
 def main(args: argparse.Namespace) -> None:
@@ -548,7 +546,7 @@ def main(args: argparse.Namespace) -> None:
     for i in range(start, args.num_samples):
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        decoded_tokens = generate(
+        decoded_tokens, decode_start = generate(
             model=model,
             prompt_tokens=prompt_tokens,
             num_new_tokens=args.num_new_tokens,
@@ -562,7 +560,7 @@ def main(args: argparse.Namespace) -> None:
 
         # Calculate metrics
         torch.cuda.synchronize()
-        time_taken = time.perf_counter() - start_time
+        time_taken = time.perf_counter() - decode_start
         num_prompt_tokens = args.batch_size * prompt_tokens.size(-1)
         num_generated_tokens = args.batch_size * (
             decoded_tokens.size(-1) - prompt_tokens.size(-1)
