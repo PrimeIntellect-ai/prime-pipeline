@@ -198,7 +198,12 @@ async def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        await comm.send(pickle.dumps(outputs))
+        t0 = perf_counter()
+        bytes = pickle.dumps(outputs.cpu())
+        logger.debug(f"Serialization took {(perf_counter() - t0) * 1000:.2f}ms")
+        t0 = perf_counter()
+        await comm.send(bytes)
+        logger.debug(f"Send took {(perf_counter() - t0) * 1000:.2f}ms")
 
         if world.is_first_stage:
             # Receive next token from last stage
@@ -300,7 +305,10 @@ async def decode(
                 input_pos,
             )
             t0 = perf_counter()
-            await comm.send(pickle.dumps(hidden_states))
+            bytes = pickle.dumps(hidden_states)
+            logger.debug(f"Serialization took {(perf_counter() - t0) * 1000:.2f}ms")
+            t0 = perf_counter() 
+            await comm.send(bytes)
             logger.debug(f"Send took {(perf_counter() - t0) * 1000:.2f}ms")
             recv_reqs[micro_batch_idx] = comm.recv()
         
@@ -342,7 +350,10 @@ async def decode(
 
             # Send hidden states or next token
             t0 = perf_counter()
-            await comm.send(pickle.dumps(outputs))
+            bytes = pickle.dumps(outputs)
+            logger.debug(f"Serialization took {(perf_counter() - t0) * 1000:.2f}ms")
+            t0 = perf_counter()
+            await comm.send(bytes)
             logger.debug(f"Send took {(perf_counter() - t0) * 1000:.2f}ms")
             
             # Schedule next recv
