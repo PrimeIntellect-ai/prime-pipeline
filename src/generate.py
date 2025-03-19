@@ -1,6 +1,7 @@
 # From: https://github.com/pytorch-labs/gpt-fast/blob/main/generate.py
 import pickle
 import argparse
+from time import perf_counter
 import time
 import asyncio
 from pathlib import Path
@@ -298,7 +299,9 @@ async def decode(
                 cur_tokens,
                 input_pos,
             )
+            t0 = perf_counter()
             await comm.send(pickle.dumps(hidden_states))
+            logger.debug(f"Send took {(perf_counter() - t0) * 1000:.2f}ms")
             recv_reqs[micro_batch_idx] = comm.recv()
         
     # Decode interleaved
@@ -310,18 +313,21 @@ async def decode(
             if world.is_first_stage:
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
+                t0 = perf_counter()
                 next_token = pickle.loads(await recv_reqs[micro_batch_idx]).to(device)
+                logger.debug(f"Recv took {(perf_counter() - t0) * 1000:.2f}ms")
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 input_pos += 1
             else:
+                t0 = perf_counter()
                 hidden_states = pickle.loads(await comm.recv()).to(device)
+                logger.debug(f"Recv took {(perf_counter() - t0) * 1000:.2f}ms")
 
             # Skip forward and send on last iteration for first stage
             if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
                 continue
 
             # Forward pass
-            logger.debug(f"Forward pass for token {input_pos}")
             outputs = model_forward(
                 model,
                 micro_batch_idx,
@@ -335,7 +341,9 @@ async def decode(
                 outputs = sample(outputs, **sampling_kwargs)
 
             # Send hidden states or next token
+            t0 = perf_counter()
             await comm.send(pickle.dumps(outputs))
+            logger.debug(f"Send took {(perf_counter() - t0) * 1000:.2f}ms")
             
             # Schedule next recv
             if world.is_first_stage:
