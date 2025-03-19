@@ -190,12 +190,11 @@ async def prefill(
         prompt_tokens = decoded_tokens[start_idx:end_idx, :num_prompt_tokens]
 
         # Forward pass
-        outputs = model_forward(
-            model,
+        outputs = model(
             micro_batch_idx,
             block_mask,
-            prompt_tokens,
             input_pos,
+            prompt_tokens,
             hidden_states,
         )
 
@@ -204,12 +203,8 @@ async def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        t0 = perf_counter()
         bytes = pickle.dumps(outputs.cpu())
-        logger.debug(f"Serialization took {(perf_counter() - t0) * 1000:.2f}ms")
-        t0 = perf_counter()
         send_tasks.append(asyncio.create_task(wrap_future(comm.send(bytes))))
-        logger.debug(f"Send took {(perf_counter() - t0) * 1000:.2f}ms")
 
         if world.is_first_stage:
             # Receive next token from last stage
@@ -222,7 +217,14 @@ async def prefill(
 
     logger.debug(f"Prefilled tokens {decoded_tokens[:, num_prompt_tokens]=}")
 
+from contextlib import contextmanager
 
+@contextmanager
+def timer(name):
+    t0 = perf_counter()
+    yield
+    logger.debug(f"{name} took {(perf_counter() - t0) * 1000:.2f}ms")
+    
 async def decode(
     model: Transformer,
     decoded_tokens: Tensor,
@@ -301,41 +303,44 @@ async def decode(
     forward_times = []
     if world.is_first_stage:
         send_tasks = []
-        input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
-        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+        with timer("Create input pos"):
+            input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
+        with timer("Adjust mask"):
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         for micro_batch_idx in range(num_micro_batches):
             start_idx = micro_batch_idx * micro_batch_size
             end_idx = start_idx + micro_batch_size
-            cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(
-                -1
-            )
-            hidden_states = model_forward(
-                model,
-                micro_batch_idx,
-                mask,
-                cur_tokens,
-                input_pos,
-            )
-            t0 = perf_counter()
-            bytes = pickle.dumps(hidden_states.cpu())
-            serialize_time = (perf_counter() - t0) * 1000
-            serialize_times.append(serialize_time) 
-            logger.debug(f"Serialization took {serialize_time:.2f}ms")
-            t0 = perf_counter() 
-            send_tasks.append(asyncio.create_task(wrap_future(comm.send(bytes))))
-            send_time = (perf_counter() - t0) * 1000
-            send_times.append(send_time)
-            logger.debug(f"Send took {send_time:.2f}ms")
+            with timer("Create cur tokens"):
+                cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(
+                    -1
+                )
+            with timer("Forward pass"):
+                hidden_states = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    cur_tokens,
+                    input_pos,
+                )
+            with timer("Serialize"):
+                bytes = pickle.dumps(hidden_states.cpu())
+            with timer("Schedule send"):
+                send_tasks.append(asyncio.create_task(wrap_future(comm.send(bytes))))
             recv_start = perf_counter()
             recv_reqs[micro_batch_idx] = comm.recv()
 
-        await asyncio.gather(*send_tasks)
+        with timer("Wait for send"):
+            await asyncio.gather(*send_tasks)
         
     # Decode interleaved
     next_token, hidden_states = None, None
     for token_idx in range(starting_pos, decoded_tokens.size(-1)):
-        input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
-        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+        logger.debug("")
+        logger.debug(f"Decoding token {token_idx}")
+        with timer("Create input pos"):
+            input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
+        with timer("Adjust mask"):
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         send_tasks = []
         for micro_batch_idx in range(num_micro_batches):
             if world.is_first_stage:
@@ -344,63 +349,43 @@ async def decode(
                 next_token = pickle.loads(await recv_reqs[micro_batch_idx]).to(device)
                 recv_time = (perf_counter() - recv_start) * 1000
                 logger.debug(f"Recv took {recv_time:.2f}ms")
-                recv_times.append(recv_time)
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 input_pos += 1
             else:
-                recv_start = perf_counter()
-                hidden_states = pickle.loads(await wrap_future(comm.recv())).to(device)
-                recv_time = (perf_counter() - recv_start) * 1000
-                logger.debug(f"Recv took {recv_time:.2f}ms")
-                recv_times.append(recv_time)
+                with timer("Recv"):
+                    hidden_states = pickle.loads(await wrap_future(comm.recv())).to(device)
 
             # Skip forward and send on last iteration for first stage
             if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
                 continue
 
             # Forward pass
-            t0 = perf_counter()
-            outputs = model_forward(
-                model,
-                micro_batch_idx,
-                mask,
-                next_token,
-                input_pos,
-                hidden_states,
-            )
-            torch.cuda.synchronize()
-            forward_time = (perf_counter() - t0) * 1000
-            logger.debug(f"Forward pass took {forward_time:.2f}ms")
-            forward_times.append(forward_time)
+            with timer("Forward pass"):
+                outputs = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    next_token,
+                    input_pos,
+                    hidden_states,
+                )
 
             if world.is_last_stage:
-                outputs = sample(outputs, **sampling_kwargs)
+                with timer("Sample"):
+                    outputs = sample(outputs, **sampling_kwargs)
 
             # Send hidden states or next token
-            t0 = perf_counter()
-            bytes = pickle.dumps(outputs.cpu())
-            serialize_time = (perf_counter() - t0) * 1000
-            serialize_times.append(serialize_time)
-            logger.debug(f"Serialization took {serialize_time:.2f}ms")
-            t0 = perf_counter()
-            send_tasks.append(asyncio.create_task(wrap_future(comm.send(bytes))))
-            send_time = (perf_counter() - t0) * 1000
-            send_times.append(send_time)
-            logger.debug(f"Send took {send_time:.2f}ms")
+            with timer("Serialize"):
+                bytes = pickle.dumps(outputs.cpu())
+            with timer("Send"):
+                send_tasks.append(asyncio.create_task(wrap_future(comm.send(bytes))))
             # Schedule next recv
             if world.is_first_stage:
                 recv_start = perf_counter()
                 recv_reqs[micro_batch_idx] = comm.recv()
 
-        await asyncio.gather(*send_tasks)
-
-
-    stats = lambda x: f"{x.mean().item():.1f}ms (std: {x.std().item():.2f}ms)"
-    logger.debug("")
-    logger.debug(f"Serialize times: {stats(torch.tensor(serialize_times))}")
-    logger.debug(f"Recv times: {stats(torch.tensor(recv_times))}")
-    logger.debug(f"Send times: {stats(torch.tensor(send_times))}")
-    logger.debug(f"Forward times: {stats(torch.tensor(forward_times))}")
+        with timer("Wait for send"):
+            await asyncio.gather(*send_tasks)
 
 @torch.no_grad()
 def generate(
