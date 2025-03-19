@@ -370,6 +370,7 @@ async def decode(
             )
             torch.cuda.synchronize()
             forward_time = (perf_counter() - t0) * 1000
+            logger.debug(f"Forward pass took {forward_time:.2f}ms")
             forward_times.append(forward_time)
 
             if world.is_last_stage:
