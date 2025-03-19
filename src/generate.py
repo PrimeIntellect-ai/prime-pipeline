@@ -441,6 +441,7 @@ def main(args: argparse.Namespace) -> None:
         t0 = time.time()
         model = shard_model(model, world.rank, world.size)
         logger.info(f"Sharded model in {time.time() - t0:.02f} seconds")
+        logger.info(f"Model: {model}")
 
     # Compile model
     if args.compile:
@@ -472,6 +473,9 @@ def main(args: argparse.Namespace) -> None:
         if args.batch_size >= world.size
         else 1
     )
+    logger.info(f"Micro-batch size: {micro_batch_size}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Num micro-batches: {args.batch_size // micro_batch_size}")
     num_prompt_tokens = prompt_tokens.size(-1)
     # hidden_states_shape = (micro_batch_size, 1, model.config.dim)
     # tokens_shape = (micro_batch_size, 1)
