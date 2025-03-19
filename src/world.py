@@ -5,6 +5,7 @@ from typing import Optional
 class World:
     def __init__(self):
         self.rank = int(os.environ.get("RANK", 0))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.size = int(os.environ.get("WORLD_SIZE", 1))
 
     @property

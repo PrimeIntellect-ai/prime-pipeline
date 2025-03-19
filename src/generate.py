@@ -428,6 +428,7 @@ def main(args: argparse.Namespace) -> None:
 
     # Set device and precision
     device = get_device(args.device, world)
+    logger.info(f"Device: {device}")
     precision = get_precision(args.precision)
 
     # Load model
