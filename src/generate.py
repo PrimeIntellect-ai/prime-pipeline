@@ -305,7 +305,7 @@ async def decode(
                 input_pos,
             )
             t0 = perf_counter()
-            bytes = pickle.dumps(hidden_states)
+            bytes = pickle.dumps(hidden_states.cpu())
             logger.debug(f"Serialization took {(perf_counter() - t0) * 1000:.2f}ms")
             t0 = perf_counter() 
             await comm.send(bytes)
@@ -350,7 +350,7 @@ async def decode(
 
             # Send hidden states or next token
             t0 = perf_counter()
-            bytes = pickle.dumps(outputs)
+            bytes = pickle.dumps(outputs.cpu())
             logger.debug(f"Serialization took {(perf_counter() - t0) * 1000:.2f}ms")
             t0 = perf_counter()
             await comm.send(bytes)
