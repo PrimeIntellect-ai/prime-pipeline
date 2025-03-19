@@ -368,6 +368,7 @@ async def decode(
                 input_pos,
                 hidden_states,
             )
+            torch.cuda.synchronize()
             forward_time = (perf_counter() - t0) * 1000
             forward_times.append(forward_time)
 
