@@ -1,9 +1,9 @@
 [project]
 name = "pipelined-gpt-fast"
 version = "0.1.0"
-description = "Add your description here"
+description = "Pipelined LLM inference over-the-internet"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "transformers",
     "sentencepiece",

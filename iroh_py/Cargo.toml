@@ -1,16 +1,20 @@
 [package]
-name = "iroh-python"
+name = "iroh_py"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 name = "iroh_py"
-crate-type = ["cdylib"]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0.97"
+iroh = "0.34.0"
+tokio = "1.44.1"
+rand = "0.8.5"
 hex = "0.4.3"
-iroh = "0.33.0"
-pyo3 = { version = "^0.23", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "^0.23", features = ["attributes", "tokio-runtime"] }
-tokio = "1.40"
+pyo3 = { version = "0.24.0", features = ["extension-module"] }
+
+[features]
+extension-module = []
