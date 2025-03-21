@@ -14,11 +14,12 @@ dependencies = [
     "torch>=2.6.0",
     "triton>=3.2.0",
     "loguru>=0.7.3",
-    "iroh_py",
+    "iroh_py @ git+https://github.com/mikasenghaas/iroh_py.git@master",
 ]
 
 [dependency-groups]
 dev = ["lovely-tensors>=0.1.18", "pytest>=8.3.5", "ruff>=0.9.10"]
 
-[tool.uv.sources]
-iroh_py = { path = "iroh_py", editable = true }
+[tool.ruff]
+line-length = 140
+ignore = ["F722", "F821"]
