@@ -3,6 +3,7 @@ import argparse
 import time
 from pathlib import Path
 from typing import Any, Optional
+from time import perf_counter
 
 # External imports
 import torch
@@ -12,7 +13,7 @@ from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import TorchP2PComm, IrohP2PComm, P2PComm, get_comm, setup_comm
+from comm import TorchP2PComm, IrohP2PComm, P2PCommBase, get_comm, setup_comm
 from logger import get_logger, setup_logger
 from model import Transformer
 from serializer import PickleSerializer
@@ -31,7 +32,7 @@ torch._functorch.config.enable_autograd_cache = True
 
 # Globals
 logger: Optional[Any] = None
-comm: Optional[P2PComm] = None
+comm: Optional[P2PCommBase] = None
 world: Optional[World] = None
 
 
@@ -194,7 +195,7 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        comm.send(outputs, tag=micro_batch_idx)
+        comm.isend(outputs, tag=micro_batch_idx)
 
         if world.is_first_stage:
             # Receive next token from last stage
@@ -297,6 +298,7 @@ def decode(
             )
             comm.isend(hidden_states, tag=micro_batch_idx)
             recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+            recv_start = perf_counter()
         
     # Decode interleaved
     next_token, hidden_states = None, None
@@ -308,17 +310,19 @@ def decode(
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
                 next_token = recv_reqs[micro_batch_idx].wait()
+                logger.debug(f"Waited for next token {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 input_pos += 1
             else:
+                recv_start = perf_counter() 
                 hidden_states = comm.recv(tag=micro_batch_idx)
+                logger.debug(f"Waited for hidden states {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
 
             # Skip forward and send on last iteration for first stage
             if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
                 continue
 
             # Forward pass
-            logger.debug(f"Forward pass for token {input_pos}")
             outputs = model_forward(
                 model,
                 micro_batch_idx,
@@ -337,6 +341,7 @@ def decode(
             # Schedule next recv
             if world.is_first_stage:
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+                recv_start = perf_counter()
 
 
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
@@ -463,6 +468,7 @@ def main(args: argparse.Namespace) -> None:
         else 1
     )
     num_prompt_tokens = prompt_tokens.size(-1)
+    num_micro_batches = args.batch_size // micro_batch_size
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)
     tokens_shape = (micro_batch_size, 1)
     hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
@@ -477,7 +483,7 @@ def main(args: argparse.Namespace) -> None:
                 num_prompt_tokens=num_prompt_tokens,
         )
     elif args.backend == "iroh":
-        setup_comm(IrohP2PComm, serializer=PickleSerializer(), device=device)
+        setup_comm(IrohP2PComm, serializer=PickleSerializer(device=device), num_micro_batches=num_micro_batches)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
