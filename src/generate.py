@@ -9,7 +9,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from comm import setup_comm
 from decode import decode, prefill
-from logger import setup_logger
+from logger import get_logger, setup_logger
 from model import get_model, get_model_shard
 from serializer import get_serializer
 from tokenizer import get_tokenizer
@@ -42,11 +42,13 @@ def generate(
     """
     # Encode prompt
     device = model.layers[0].feed_forward.w1.weight.device
-    prompt_tokens = tokenizer.encode(prompt)
+    prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
     prompt_tokens = torch.tensor(
         prompt_tokens,
         device=device,
     ).repeat(batch_size, 1)
+
+    get_logger().info(f"Prompt tokens: {prompt_tokens}")
 
     # Setup model cache
     num_prompt_tokens = prompt_tokens.size(-1)
