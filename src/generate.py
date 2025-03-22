@@ -278,8 +278,11 @@ def decode(
     # Decode interleaved
     next_token, hidden_states = None, None
     for token_idx in range(starting_pos, decoded_tokens.size(-1)):
+        logger.debug(f"Decoding token {token_idx}")
         input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+        if world.is_first_stage:
+            input_pos += 1
         for micro_batch_idx in range(num_micro_batches):
             if world.is_first_stage:
                 start_idx = micro_batch_idx * micro_batch_size
@@ -287,7 +290,6 @@ def decode(
                 next_token = recv_reqs[micro_batch_idx].wait()
                 logger.debug(f"Waited for next token {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
-                input_pos += 1
             else:
                 recv_start = perf_counter()
                 hidden_states = comm.recv(tag=micro_batch_idx)
