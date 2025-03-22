@@ -783,6 +783,7 @@ dependencies = [
     { name = "dotenv" },
     { name = "iroh-py" },
     { name = "loguru" },
+    { name = "lovely-tensors" },
     { name = "sentencepiece" },
     { name = "setuptools" },
     { name = "tiktoken" },
@@ -793,7 +794,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "lovely-tensors" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -804,6 +804,7 @@ requires-dist = [
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "iroh-py", git = "https://github.com/mikasenghaas/iroh_py.git?rev=master" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "lovely-tensors", specifier = ">=0.1.18" },
     { name = "sentencepiece" },
     { name = "setuptools", specifier = ">=75.8.2" },
     { name = "tiktoken" },
@@ -814,7 +815,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "lovely-tensors", specifier = ">=0.1.18" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "ruff", specifier = ">=0.9.10" },
 ]

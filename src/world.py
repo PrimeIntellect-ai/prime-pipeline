@@ -31,13 +31,8 @@ class World:
 _WORLD: Optional[World] = None
 
 
-def setup_world():
-    global _WORLD
-    assert _WORLD is None, "World already setup"
-    _WORLD = World()
-
-
 def get_world() -> World:
     global _WORLD
-    assert _WORLD is not None, "World not setup"
+    if _WORLD is None:
+        _WORLD = World()
     return _WORLD

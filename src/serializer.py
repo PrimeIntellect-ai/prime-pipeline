@@ -23,3 +23,7 @@ class PickleSerializer(Serializer):
 
     def deserialize(self, data: bytes) -> torch.Tensor:
         return pickle.loads(data).to(self.device)
+
+
+def get_serializer(device: torch.device) -> Serializer:
+    return PickleSerializer(device)

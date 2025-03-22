@@ -1,25 +1,23 @@
-# From: https://github.com/pytorch-labs/gpt-fast/blob/main/generate.py
 import argparse
 import time
-from pathlib import Path
-from typing import Any, Optional
 from time import perf_counter
+from typing import Optional
 
-# External imports
 import torch
 import torch._dynamo.config
 import torch._inductor.config
+import torch.nn as nn
 from lovely_tensors import monkey_patch
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import TorchP2PComm, IrohP2PComm, P2PCommBase, get_comm, setup_comm
+from comm import get_comm
 from logger import get_logger, setup_logger
-from model import Transformer
-from serializer import PickleSerializer
+from model import get_model, get_model_shard
+from serializer import get_serializer
 from tokenizer import get_tokenizer
-from utils import get_device, get_precision, load_model, seed_everything, shard_model
-from world import World, get_world, setup_world
+from utils import get_device, get_precision, seed_everything
+from world import get_world
 
 # Use lovely tensors
 monkey_patch()
@@ -31,9 +29,9 @@ torch._inductor.config.fx_graph_cache = True
 torch._functorch.config.enable_autograd_cache = True
 
 # Globals
-logger: Optional[Any] = None
-comm: Optional[P2PCommBase] = None
-world: Optional[World] = None
+logge = None
+comm = None
+world = None
 
 
 def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
@@ -42,16 +40,12 @@ def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
     q = torch.empty_like(probs_sort).exponential_(1)
 
     # Select the argmax
-    next_tokens = torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(
-        dtype=torch.long
-    )
+    next_tokens = torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.long)
 
     return next_tokens
 
 
-def logits_to_probs(
-    logits: Tensor, temperature: float = 1.0, top_k: Optional[int] = None
-) -> Tensor:
+def logits_to_probs(logits: Tensor, temperature: float = 1.0, top_k: Optional[int] = None) -> Tensor:
     """Convert logits to probabilities from (B, S, H) to (B, S)"""
     # Temperature scaling (capped at minimum temperature of 1e-5)
     logits = logits / max(temperature, 1e-5)
@@ -68,9 +62,7 @@ def logits_to_probs(
     return probs
 
 
-def sample(
-    logits: Tensor, temperature: float = 1.0, top_k: Optional[int] = None
-) -> Tensor:
+def sample(logits: Tensor, temperature: float = 1.0, top_k: Optional[int] = None) -> Tensor:
     """Sample from a multinomial distribution without a cuda synchronization"""
     probs = logits_to_probs(logits[:, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
@@ -82,9 +74,7 @@ def causal_mask(b, h, q, kv):
     return q >= kv
 
 
-def adjust_mask(
-    block_mask: BlockMask, input_pos: Tensor, max_seq_length: int
-) -> BlockMask:
+def adjust_mask(block_mask: BlockMask, input_pos: Tensor, max_seq_length: int) -> BlockMask:
     """Adjust the mask for the given input position"""
     assert input_pos.shape[-1] == 1
     block_index = input_pos // block_mask.BLOCK_SIZE[0]
@@ -96,7 +86,7 @@ def adjust_mask(
 
 
 def model_forward(
-    model: Transformer,
+    model: nn.Module,
     micro_batch_idx: int,
     block_mask: BlockMask,
     prompt_tokens: Optional[Tensor],
@@ -108,7 +98,7 @@ def model_forward(
 
 
 def adjust_mask_and_model_forward(
-    model: Transformer,
+    model: nn.Module,
     micro_batch_idx: int,
     block_mask: BlockMask,
     input_pos: Tensor,
@@ -117,13 +107,11 @@ def adjust_mask_and_model_forward(
 ) -> Tensor:
     """Wrapper for adjust mask and forward pass of the model for torch.compile"""
     mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-    return model_forward(
-        model, micro_batch_idx, mask, input_pos, prompt_tokens, hidden_states
-    )
+    return model_forward(model, micro_batch_idx, mask, input_pos, prompt_tokens, hidden_states)
 
 
 def prefill(
-    model: Transformer,
+    model: nn.Module,
     decoded_tokens: Tensor,
     micro_batch_size: int,
     num_prompt_tokens: int,
@@ -144,9 +132,7 @@ def prefill(
     Returns:
         next_token: Tensor of shape [batch_size, 1]
     """
-    logger.debug(
-        f"prefill(model, {decoded_tokens=}, {num_prompt_tokens=}, {micro_batch_size=})"
-    )
+    logger.debug(f"prefill(model, {decoded_tokens=}, {num_prompt_tokens=}, {micro_batch_size=})")
 
     # Create input positions
     input_pos = torch.arange(num_prompt_tokens, device=decoded_tokens.device)
@@ -195,6 +181,7 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
+        logger.debug(f"Sending hidden states or next token to next stage {outputs.device=}")
         comm.isend(outputs, tag=micro_batch_idx)
 
         if world.is_first_stage:
@@ -209,7 +196,7 @@ def prefill(
 
 
 def decode(
-    model: Transformer,
+    model: nn.Module,
     decoded_tokens: Tensor,
     num_prompt_tokens: int,
     micro_batch_size: int,
@@ -231,9 +218,7 @@ def decode(
     Returns:
         next_tokens: Tensor of shape [batch_size, num_new_tokens]
     """
-    logger.debug(
-        f"decode(model, {decoded_tokens=}, {num_prompt_tokens=}, {micro_batch_size=})"
-    )
+    logger.debug(f"decode(model, {decoded_tokens=}, {num_prompt_tokens=}, {micro_batch_size=})")
 
     starting_pos = num_prompt_tokens + 1
     if starting_pos >= decoded_tokens.size(-1):
@@ -262,16 +247,8 @@ def decode(
             for micro_batch_idx in range(num_micro_batches):
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
-                cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(
-                    -1
-                )
-                logits = model_forward(
-                    model,
-                    micro_batch_idx,
-                    mask,
-                    cur_tokens,
-                    input_pos
-                )
+                cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(-1)
+                logits = model_forward(model, micro_batch_idx, mask, cur_tokens, input_pos)
                 next_token = sample(logits, **sampling_kwargs)
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
         logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
@@ -286,9 +263,7 @@ def decode(
         for micro_batch_idx in range(num_micro_batches):
             start_idx = micro_batch_idx * micro_batch_size
             end_idx = start_idx + micro_batch_size
-            cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(
-                -1
-            )
+            cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(-1)
             hidden_states = model_forward(
                 model,
                 micro_batch_idx,
@@ -299,7 +274,7 @@ def decode(
             comm.isend(hidden_states, tag=micro_batch_idx)
             recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
             recv_start = perf_counter()
-        
+
     # Decode interleaved
     next_token, hidden_states = None, None
     for token_idx in range(starting_pos, decoded_tokens.size(-1)):
@@ -314,7 +289,7 @@ def decode(
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 input_pos += 1
             else:
-                recv_start = perf_counter() 
+                recv_start = perf_counter()
                 hidden_states = comm.recv(tag=micro_batch_idx)
                 logger.debug(f"Waited for hidden states {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
 
@@ -337,18 +312,18 @@ def decode(
 
             # Send hidden states or next token
             comm.isend(outputs, tag=micro_batch_idx)
-            
+
             # Schedule next recv
             if world.is_first_stage:
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
                 recv_start = perf_counter()
 
-
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
+
 
 @torch.no_grad()
 def generate(
-    model: Transformer,
+    model: nn.Module,
     prompt_tokens: Tensor,
     num_new_tokens: int,
     micro_batch_size: int,
@@ -377,9 +352,7 @@ def generate(
         )
 
     # Allocate tensor for decoded tokens
-    decoded_tokens = torch.empty(
-        batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device
-    )
+    decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
     decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
 
     # Prefill prompt tokens
@@ -392,7 +365,6 @@ def generate(
     )
 
     # Decode remaining tokens
-    decode_start = time.perf_counter()
     decode(
         model=model,
         decoded_tokens=decoded_tokens,
@@ -401,41 +373,36 @@ def generate(
         **sampling_kwargs,
     )
 
-    return decoded_tokens, decode_start
+    return decoded_tokens
 
 
 def main(args: argparse.Namespace) -> None:
-    # Setup world and communication
-    setup_world()
-    global world
+    global logger, world, comm
+    # Setup world
     world = get_world()
 
     # Initialize logger
     setup_logger(world.rank, log_level=args.log_level)
-    global logger
     logger = get_logger()
-    logger.info("Starting")
+    logger.info("Starting generation...")
     torch.cuda.synchronize()
     logger.info(f"Args: {vars(args)}")
 
     # Set seeds for reproducibility across all processes
+    logger.info(f"Setting seeds for reproducibility {args.seed=}")
     seed_everything(args.seed)
 
-    # Set device and precision
+    # Load model
     device = get_device(args.device, world)
     precision = get_precision(args.precision)
-
-    # Load model
+    logger.info(f"Loading model {args.model_name} on device {device} and precision {precision}")
     t0 = time.time()
-    checkpoint_path = Path(f"checkpoints/{args.model_repo}/model.pth")
-    model = load_model(checkpoint_path, device, precision)
-    logger.info(f"Loaded model in {time.time() - t0:.02f} seconds")
-
-    # Shard model
-    if world.size > 1:
-        t0 = time.time()
-        model = shard_model(model, world.rank, world.size)
-        logger.info(f"Sharded model in {time.time() - t0:.02f} seconds")
+    if world.size == 1:
+        model = get_model(args.model_name, device, precision)
+        logger.info(f"Loaded model in {time.time() - t0:.02f} seconds")
+    else:
+        model = get_model_shard(args.model_name, world.rank, world.size, device, precision)
+        logger.info(f"Loaded model shard in {time.time() - t0:.02f} seconds")
 
     # Compile model
     if args.compile:
@@ -449,8 +416,8 @@ def main(args: argparse.Namespace) -> None:
         model_forward = torch.compile(model_forward, fullgraph=True)
 
     # Load tokenizer
-    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
-    tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
+    logger.info(f"Loading tokenizer for {args.model_name}")
+    tokenizer = get_tokenizer(args.model_name)
 
     # Encode prompt (batch_size, num_prompt_tokens)
     prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(args.prompt)
@@ -474,28 +441,30 @@ def main(args: argparse.Namespace) -> None:
     hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
     tokens_dtype = torch.long
     if args.backend == "torch":
-        setup_comm(TorchP2PComm, 
-                fwd_shape=hidden_states_shape,
-                bwd_shape=tokens_shape,
-                fwd_dtype=hidden_states_dtype,
-                bwd_dtype=tokens_dtype,
-                device=device,
-                num_prompt_tokens=num_prompt_tokens,
+        kwargs = dict(
+            fwd_shape=hidden_states_shape,
+            bwd_shape=tokens_shape,
+            fwd_dtype=hidden_states_dtype,
+            bwd_dtype=tokens_dtype,
+            device=device,
+            num_prompt_tokens=num_prompt_tokens,
         )
     elif args.backend == "iroh":
-        setup_comm(IrohP2PComm, serializer=PickleSerializer(device=device), num_micro_batches=num_micro_batches)
+        serializer = get_serializer(device=device)
+        kwargs = dict(
+            serializer=serializer,
+            num_micro_batches=num_micro_batches,
+        )
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
-
-    global comm
-    comm = get_comm()
+    comm = get_comm(args.backend, **kwargs)
 
     start = -1 if args.compile else 0
     metrics = {"latency": [], "tps": []}
     for i in range(start, args.num_samples):
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        decoded_tokens, decode_start = generate(
+        decoded_tokens = generate(
             model=model,
             prompt_tokens=prompt_tokens,
             num_new_tokens=args.num_new_tokens,
@@ -509,20 +478,16 @@ def main(args: argparse.Namespace) -> None:
 
         # Calculate metrics
         torch.cuda.synchronize()
-        time_taken = time.perf_counter() - decode_start
+        time_taken = time.perf_counter() - start_time
         num_prompt_tokens = args.batch_size * prompt_tokens.size(-1)
-        num_generated_tokens = args.batch_size * (
-            decoded_tokens.size(-1) - prompt_tokens.size(-1)
-        )
+        num_generated_tokens = args.batch_size * (decoded_tokens.size(-1) - prompt_tokens.size(-1))
         num_total_tokens = num_prompt_tokens + num_generated_tokens
         metrics["latency"].append(time_taken)
         metrics["tps"].append(num_generated_tokens / time_taken)
 
         # Print generations (on main rank)
         if world.rank == 0:
-            logger.info(
-                f"First generation: {tokenizer.decode(decoded_tokens[0].tolist())}"
-            )
+            logger.info(f"First generation: {tokenizer.decode(decoded_tokens[0].tolist())}")
 
     # Print metrics (on main rank)
     if world.rank == 0:
@@ -530,16 +495,13 @@ def main(args: argparse.Namespace) -> None:
         logger.info(f"Number of prompt tokens: {num_prompt_tokens}")
         logger.info(f"Number of generated tokens: {num_generated_tokens}")
         logger.info(f"Number of total tokens: {num_total_tokens}")
-        logger.info(
-            f"Latency: {torch.mean(torch.tensor(metrics['latency'])).item():.2f} seconds"
-        )
-        logger.info(
-            f"Throughput: {torch.mean(torch.tensor(metrics['tps'])).item():.2f} tokens/second"
-        )
+        logger.info(f"Latency: {torch.mean(torch.tensor(metrics['latency'])).item():.2f} seconds")
+        logger.info(f"Throughput: {torch.mean(torch.tensor(metrics['tps'])).item():.2f} tokens/second")
         logger.info(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
     # Destroy communication
     comm.destroy()
+    logger.info("Done!")
 
 
 if __name__ == "__main__":
@@ -548,14 +510,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--model-repo",
+        "--model-name",
         type=str,
-        default="meta-llama/Llama-2-7b-chat-hf",
-        help="Model repository.",
+        default="meta-llama/llama-2-7b-chat-hf",
+        help="Model name.",
     )
-    parser.add_argument(
-        "--prompt", type=str, default="Hello, my name is", help="Input prompt."
-    )
+    parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Input prompt.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size.")
     parser.add_argument(
         "--micro-batch-size",
@@ -563,9 +523,7 @@ if __name__ == "__main__":
         default=None,
         help="Number of micro-batches. If not provided, will use world.size if batch_size >= world.size else 1.",
     )
-    parser.add_argument(
-        "--num-samples", type=int, default=1, help="Number of samples to generate."
-    )
+    parser.add_argument("--num-samples", type=int, default=1, help="Number of samples to generate.")
     parser.add_argument(
         "--num-new-tokens",
         type=int,
@@ -573,27 +531,21 @@ if __name__ == "__main__":
         help="Number of new tokens to generate.",
     )
     parser.add_argument("--top-k", type=int, default=200, help="Top-k for sampling.")
-    parser.add_argument(
-        "--temperature", type=float, default=0.8, help="Temperature for sampling."
-    )
+    parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for sampling.")
     parser.add_argument(
         "--compile",
         action="store_true",
         default=False,
         help="Whether to compile the model.",
     )
-    parser.add_argument(
-        "--device", type=str, default="cuda", help="Device to use for the model."
-    )
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use for the model.")
     parser.add_argument(
         "--precision",
         type=str,
         default="bfloat16",
         help="Precision to use for the model.",
     )
-    parser.add_argument(
-        "--seed", type=int, default=1234, help="Seed for reproducibility."
-    )
+    parser.add_argument("--seed", type=int, default=1234, help="Seed for reproducibility.")
     parser.add_argument("--log-level", type=str, default="INFO", help="Log level.")
     parser.add_argument(
         "--backend",

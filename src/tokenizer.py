@@ -1,9 +1,11 @@
 import os
+from pathlib import Path
+from typing import Dict
+
 import sentencepiece as spm
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from pathlib import Path
-from typing import Dict
+
 
 class TokenizerInterface:
     def __init__(self, model_path):
@@ -21,6 +23,7 @@ class TokenizerInterface:
     def eos_id(self):
         raise NotImplementedError("This method should be overridden by subclasses.")
 
+
 class SentencePieceWrapper(TokenizerInterface):
     def __init__(self, model_path):
         super().__init__(model_path)
@@ -37,6 +40,7 @@ class SentencePieceWrapper(TokenizerInterface):
 
     def eos_id(self):
         return self.processor.eos_id()
+
 
 class TiktokenWrapper(TokenizerInterface):
     """
@@ -65,13 +69,8 @@ class TiktokenWrapper(TokenizerInterface):
             "<|end_header_id|>",
             "<|reserved_special_token_4|>",
             "<|eot_id|>",  # end of turn
-        ] + [
-            f"<|reserved_special_token_{i}|>"
-            for i in range(5, self.num_reserved_special_tokens - 5)
-        ]
-        self.special_tokens = {
-            token: num_base_tokens + i for i, token in enumerate(special_tokens)
-        }
+        ] + [f"<|reserved_special_token_{i}|>" for i in range(5, self.num_reserved_special_tokens - 5)]
+        self.special_tokens = {token: num_base_tokens + i for i, token in enumerate(special_tokens)}
         self.model = tiktoken.Encoding(
             name=Path(model_path).name,
             pat_str=self.pat_str,
@@ -94,10 +93,11 @@ class TiktokenWrapper(TokenizerInterface):
     def eos_id(self):
         return self._eos_id
 
-def get_tokenizer(tokenizer_model_path, model_name):
+
+def get_tokenizer(model_name):
     """
     Factory function to get the appropriate tokenizer based on the model name.
-    
+
     Args:
     - tokenizer_model_path (str): The file path to the tokenizer model.
     - model_name (str): The name of the model, used to determine the tokenizer type.
@@ -106,7 +106,8 @@ def get_tokenizer(tokenizer_model_path, model_name):
     - TokenizerInterface: An instance of a tokenizer.
     """
 
+    tokenizer_path = Path(f"checkpoints/{model_name}/tokenizer.model")
     if "llama-3" in str(model_name).lower():
-        return TiktokenWrapper(tokenizer_model_path)
+        return TiktokenWrapper(tokenizer_path)
     else:
-        return SentencePieceWrapper(tokenizer_model_path)
+        return SentencePieceWrapper(tokenizer_path)

@@ -1,7 +1,7 @@
 [project]
 name = "pipelined-gpt-fast"
 version = "0.1.0"
-description = "Pipelined LLM inference over-the-internet"
+description = "AGI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,12 +14,12 @@ dependencies = [
     "torch>=2.6.0",
     "triton>=3.2.0",
     "loguru>=0.7.3",
+    "lovely-tensors>=0.1.18",
     "iroh_py @ git+https://github.com/mikasenghaas/iroh_py.git@master",
 ]
 
 [dependency-groups]
-dev = ["lovely-tensors>=0.1.18", "pytest>=8.3.5", "ruff>=0.9.10"]
+dev = ["pytest>=8.3.5", "ruff>=0.9.10"]
 
 [tool.ruff]
 line-length = 140
-ignore = ["F722", "F821"]

@@ -1,20 +1,22 @@
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Type, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
+from iroh_py import Node, RecvWork, SendWork
 
-from iroh_py import Node, SendWork, RecvWork
 from logger import get_logger
 from serializer import Serializer
 from world import get_world
+
 
 class WorkBase(ABC):
     @abstractmethod
     def wait(self) -> Optional[torch.Tensor]:
         pass
+
 
 class P2PCommBase(ABC):
     def __init__(self, serializer: Optional[Serializer] = None):
@@ -37,19 +39,21 @@ class P2PCommBase(ABC):
     def destroy(self):
         pass
 
+
 _COMM: Optional[P2PCommBase] = None
 
 
-def setup_comm(target: Type[P2PCommBase], **kwargs):
+def get_comm(comm_backend: str, **kwargs) -> P2PCommBase:
     global _COMM
-    assert _COMM is None, "Comm already setup"
-    _COMM = target(**kwargs)
-
-
-def get_comm() -> P2PCommBase:
-    global _COMM
-    assert _COMM is not None, "Comm not setup"
+    if _COMM is None:
+        if comm_backend == "torch":
+            _COMM = TorchP2PComm(**kwargs)
+        elif comm_backend == "iroh":
+            _COMM = IrohP2PComm(**kwargs)
+        else:
+            raise ValueError(f"Invalid comm type: {comm_backend}")
     return _COMM
+
 
 class TorchWork(WorkBase):
     def __init__(self, tensor: Optional[torch.Tensor], work: dist.Work):
@@ -87,9 +91,7 @@ class TorchP2PComm(P2PCommBase):
             os.environ["MASTER_ADDR"] = "localhost"
         if not os.environ.get("MASTER_PORT"):
             os.environ["MASTER_PORT"] = "29500"
-        self.process_group = dist.init_process_group(
-            init_method=init_method, backend=backend
-        )
+        self.process_group = dist.init_process_group(init_method=init_method, backend=backend)
 
     def _send_fwd(self, hidden_states: torch.Tensor, tag: int) -> TorchWork:
         """Sends hidden states to the next stage"""
@@ -136,11 +138,7 @@ class TorchP2PComm(P2PCommBase):
         """Receives tensor (hidden states or next token) from the correct previous rank"""
         if self.world.size <= 1:
             return None
-        shape = (
-            (self.bwd_shape, self.bwd_prefill_shape)
-            if self.world.is_first_stage
-            else (self.fwd_shape, self.fwd_prefill_shape)
-        )
+        shape = (self.bwd_shape, self.bwd_prefill_shape) if self.world.is_first_stage else (self.fwd_shape, self.fwd_prefill_shape)
         recv_fwd_or_bwd = self._recv_bwd if self.world.is_first_stage else self._recv_fwd
         return recv_fwd_or_bwd(tag, shape[int(prefill)])
 
@@ -148,16 +146,19 @@ class TorchP2PComm(P2PCommBase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-class IrohWork(WorkBase):
-     def __init__(self, work: Union[SendWork, RecvWork], serializer: Optional[Serializer] = None):
-         self.work = work
-         self.serializer = serializer
 
-     def wait(self) -> Optional[torch.Tensor]:
-         return self.serializer.deserialize(self.work.wait()) if self.serializer else self.work.wait()
+class IrohWork(WorkBase):
+    def __init__(self, work: Union[SendWork, RecvWork], serializer: Optional[Serializer] = None):
+        self.work = work
+        self.serializer = serializer
+
+    def wait(self) -> Optional[torch.Tensor]:
+        return self.serializer.deserialize(self.work.wait()) if self.serializer else self.work.wait()
+
 
 class IrohP2PComm(P2PCommBase):
     """IrohNode running receiver and sender in separate processes with non-blocking API"""
+
     def __init__(self, serializer: Serializer, num_micro_batches: int):
         super().__init__(serializer)
         self.logger = get_logger()
@@ -168,18 +169,21 @@ class IrohP2PComm(P2PCommBase):
 
     def _setup(self):
         # Create node
-        self.node = Node(self.num_micro_batches)
+        self.node = Node.with_seed(self.num_micro_batches, seed=int(os.environ.get("IROH_SEED")))
         self.logger.info(f"Listening on {self.node.node_id()}")
-        
+
         # Connect to remote node
-        self.logger.info("Please enter the server's public key: ")
-        self.node.connect(input().strip())
+        peer_id = os.environ.get("IROH_PEER_ID")
+        if peer_id is None:
+            self.logger.info("Didn't find IROH_PEER_ID environment variable, please enter the peer's public key: ")
+            peer_id = input().strip()
+        self.node.connect(peer_id)
 
         # Wait for connection to be established
         while not self.node.is_ready():
             time.sleep(1 / 100)
         self.logger.info("Connected!")
-        
+
     def irecv(self, tag: int, **kwargs) -> Optional[IrohWork]:
         if self.world.size <= 1:
             return None
@@ -201,4 +205,4 @@ class IrohP2PComm(P2PCommBase):
             return work.wait()
 
     def destroy(self):
-        pass # TODO: Implement
+        pass  # TODO: Implement
