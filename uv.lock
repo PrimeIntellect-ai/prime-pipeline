@@ -285,7 +285,7 @@ wheels = [
 [[package]]
 name = "iroh-py"
 version = "0.1.0"
-source = { git = "https://github.com/mikasenghaas/iroh_py.git?rev=master#71a1ca689adf1053d5877b9381ceef70276f35c7" }
+source = { git = "https://github.com/primeintellect-ai/iroh_py.git?rev=71a1ca6#71a1ca689adf1053d5877b9381ceef70276f35c7" }
 
 [[package]]
 name = "jedi"
@@ -802,7 +802,7 @@ dev = [
 requires-dist = [
     { name = "blobfile" },
     { name = "dotenv", specifier = ">=0.9.9" },
-    { name = "iroh-py", git = "https://github.com/mikasenghaas/iroh_py.git?rev=master" },
+    { name = "iroh-py", git = "https://github.com/primeintellect-ai/iroh_py.git?rev=71a1ca6" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "lovely-tensors", specifier = ">=0.1.18" },
     { name = "sentencepiece" },

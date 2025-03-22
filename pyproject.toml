@@ -15,7 +15,7 @@ dependencies = [
     "triton>=3.2.0",
     "loguru>=0.7.3",
     "lovely-tensors>=0.1.18",
-    "iroh_py @ git+https://github.com/mikasenghaas/iroh_py.git@master",
+    "iroh_py @ git+https://github.com/primeintellect-ai/iroh_py.git@71a1ca6",
 ]
 
 [dependency-groups]
