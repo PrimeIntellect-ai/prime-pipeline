@@ -43,15 +43,21 @@ class P2PCommBase(ABC):
 _COMM: Optional[P2PCommBase] = None
 
 
-def get_comm(comm_backend: str, **kwargs) -> P2PCommBase:
+def setup_comm(comm_backend: str, **kwargs) -> P2PCommBase:
     global _COMM
-    if _COMM is None:
-        if comm_backend == "torch":
-            _COMM = TorchP2PComm(**kwargs)
-        elif comm_backend == "iroh":
-            _COMM = IrohP2PComm(**kwargs)
-        else:
-            raise ValueError(f"Invalid comm type: {comm_backend}")
+    assert _COMM is None, "Comm already setup"
+    if comm_backend == "torch":
+        _COMM = TorchP2PComm(**kwargs)
+    elif comm_backend == "iroh":
+        _COMM = IrohP2PComm(**kwargs)
+    else:
+        raise ValueError(f"Invalid comm type: {comm_backend}")
+    return _COMM
+
+
+def get_comm() -> P2PCommBase:
+    global _COMM
+    assert _COMM is not None, "Comm not setup"
     return _COMM
 
 

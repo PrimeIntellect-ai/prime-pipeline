@@ -35,7 +35,7 @@ main() {
     log_info "Installing dependencies..."
     uv sync
         
-    log_info "Installation completed! You can double check that everything is install correctly by running 'RANK=0 WORLD_SIZE=1 uv run python src/pipelined_gpt_fast/generate.py"
+    log_info "Installation completed! You can double check that everything is install correctly by running 'RANK=0 WORLD_SIZE=1 uv run python src/generate.py'"
 }
 
 main

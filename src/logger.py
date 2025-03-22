@@ -19,9 +19,11 @@ def setup_logger(rank: int, log_level: str = "INFO"):
     )
 
     _LOGGER = loguru_logger.bind(rank=rank)
+    return _LOGGER
 
 
 def get_logger():
     """Get global logger instance."""
+    global _LOGGER
     assert _LOGGER is not None, "Logger not setup"
     return _LOGGER
