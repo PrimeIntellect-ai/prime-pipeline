@@ -106,7 +106,7 @@ def get_tokenizer(model_name):
     - TokenizerInterface: An instance of a tokenizer.
     """
 
-    tokenizer_path = Path(f"checkpoints/{model_name}/tokenizer.model")
+    tokenizer_path = Path(f"/ephemeral/{model_name}/tokenizer.model")
     if "llama-3" in str(model_name).lower():
         return TiktokenWrapper(tokenizer_path)
     else:

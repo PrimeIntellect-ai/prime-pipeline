@@ -13,7 +13,7 @@ from logger import get_logger
 
 MODEL_REGISTRY = {
     "meta-llama/llama-2-7b-chat-hf": dict(n_layer=32, n_head=32, dim=4096),
-    "meta-llama/llama-3-8b": dict(
+    "meta-llama/meta-llama-3-8b": dict(
         block_size=8192,
         n_layer=32,
         n_head=32,
@@ -23,7 +23,7 @@ MODEL_REGISTRY = {
         vocab_size=128256,
         rope_base=500000,
     ),
-    "meta-llama/llama-3-70b": dict(
+    "meta-llama/meta-llama-3-70b": dict(
         block_size=8192,
         n_layer=80,
         n_head=64,
@@ -33,7 +33,7 @@ MODEL_REGISTRY = {
         vocab_size=128256,
         rope_base=500000,
     ),
-    "meta-llama/llama-3.1-8b": dict(
+    "meta-llama/meta-llama-3.1-8b": dict(
         block_size=131072,
         n_layer=32,
         n_head=32,
@@ -49,7 +49,7 @@ MODEL_REGISTRY = {
             original_max_position_embeddings=8192,
         ),
     ),
-    "meta-llama/llama-3.1-70b": dict(
+    "meta-llama/meta-llama-3.1-70b": dict(
         block_size=131072,
         n_layer=80,
         n_head=64,
@@ -230,11 +230,11 @@ class Transformer(nn.Module):
             model = cls(ModelArgs.from_name(model_name))
 
         # Search for .pth file in checkpoints/model_name directory
-        model_path = Path(f"checkpoints/{model_name}/model.pth")
+        model_path = Path(f"/ephemeral/{model_name}/model.pth")
         if not model_path.exists():
             # Download the model and convert it to a .pth file
             if not model_path.parent.exists():
-                snapshot_download(model_name, local_dir=Path("checkpoints") / model_name)
+                snapshot_download(model_name, local_dir=model_path.parent, ignore_patterns=["*.pth"])
             convert_model(model_name)
 
         state_dict = torch.load(str(model_path), mmap=True, weights_only=True)
@@ -438,14 +438,15 @@ def get_model(model_name: str, device: torch.device, precision: torch.dtype) -> 
 
 def get_model_shard(model_name: str, rank: int, world_size: int, device: torch.device, precision: torch.dtype) -> TransformerShard:
     """Factory function to get the appropriate model shard based on the model name."""
-    return TransformerShard(rank, world_size, get_model(model_name, device, precision))
+    return TransformerShard(rank, world_size, get_model(model_name, "cpu", precision)).to(device=device)
 
 
 if __name__ == "__main__":
     print("Running model.py")
 
-    model = Transformer.from_name("meta-llama/llama-2-7b-chat-hf")
-    print(model)
+    from logger import setup_logger
 
-    shard = get_model_shard("meta-llama/llama-2-7b-chat-hf", 0, 2)
-    print(shard)
+    setup_logger(0, "DEBUG")
+    # model = get_model("meta-llama/meta-llama-3-70b", "cpu", torch.bfloat16)
+    model = get_model_shard("meta-llama/meta-llama-3-70b", 0, 4, "cpu", torch.bfloat16)
+    print(model)

@@ -4,8 +4,9 @@ import shutil
 from pathlib import Path
 
 import torch
-from model import ModelArgs
 from safetensors.torch import load_file as load_safetensors_file
+
+from model import ModelArgs
 from world import World
 
 
@@ -39,7 +40,7 @@ def convert_model(model_name: str) -> None:
     config = ModelArgs.from_name(model_name)
 
     # Load the json file containing weight mapping
-    checkpoint_dir = Path("checkpoints") / model_name
+    checkpoint_dir = Path("/ephemeral") / model_name
     model_map_json_safetensors = checkpoint_dir / "model.safetensors.index.json"
     model_map_json_pytorch = checkpoint_dir / "pytorch_model.bin.index.json"
     model_map_json = None
