@@ -232,6 +232,8 @@ def decode(
     )
 
     # Single-node
+    send_reqs = [None] * num_micro_batches
+    recv_reqs = [None] * num_micro_batches
     if world.size == 1:
         time_per_token = []
         for token_idx in range(starting_pos, decoded_tokens.size(-1)):
@@ -251,8 +253,6 @@ def decode(
 
     # Multi-node
     else:
-        send_reqs = [None] * num_micro_batches
-        recv_reqs = [None] * num_micro_batches
         if world.is_first_stage:
             input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)

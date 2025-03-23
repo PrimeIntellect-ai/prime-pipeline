@@ -207,7 +207,7 @@ if __name__ == "__main__":
     # Constant arguments
     parser.add_argument("--model-name", type=str, default="meta-llama/llama-2-7b-chat-hf", help="HF model name.")
     parser.add_argument("--num-devices", type=int, default=1, help="Number of pipeline stages.")
-    parser.add_argument("--num-iterations", type=int, default=1, help="Number of samples to generate.")
+    parser.add_argument("--num-iterations", type=int, default=3, help="Number of samples to generate.")
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Prompt to generate from.")
     parser.add_argument("--num-new-tokens", type=int, default=10, help="Number of tokens to generate.")
     parser.add_argument("--precision", type=str, default="bfloat16", help="Precision to use for the model.")
