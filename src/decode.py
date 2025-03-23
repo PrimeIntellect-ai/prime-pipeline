@@ -1,5 +1,5 @@
 from time import perf_counter
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch._dynamo.config
@@ -101,11 +101,12 @@ def prefill(
     micro_batch_size: int,
     num_prompt_tokens: int,
     **sampling_kwargs,
-) -> None:
+) -> Dict:
     """
     Prefill prompt tokens to start inference. Assumes that the model caches are
     set up, the prompt is tokenized and put into a tensor of shape [batch_size, seq_length].
-    Automatically handles pipelining using synchronous communication primitives.
+    Automatically handles pipelining using synchronous communication primitives. Returns
+    a dictionary of metrics.
 
     Args:
         model: Transformer
@@ -115,7 +116,7 @@ def prefill(
         **sampling_kwargs: Dict of kwargs for the sample function
 
     Returns:
-        next_token: Tensor of shape [batch_size, 1]
+        metrics: Dict of metrics
     """
     world, logger, comm = get_world(), get_logger(), get_comm()
     logger.debug(f"prefill(model, {decoded_tokens=}, {num_prompt_tokens=}, {micro_batch_size=})")
@@ -142,6 +143,7 @@ def prefill(
     num_prompt_tokens = input_pos.size(0)
     num_micro_batches = batch_size // micro_batch_size
     next_token, hidden_states = None, None
+    start_prefill = perf_counter()
     for micro_batch_idx in range(num_micro_batches):
         # Receive hidden states from previous stage
         if not world.is_first_stage:
@@ -167,7 +169,6 @@ def prefill(
             outputs = sample(outputs, **sampling_kwargs)
 
         # Send hidden states or next token to next stage
-        logger.debug(f"Sending hidden states or next token to next stage {outputs.device=}")
         comm.isend(outputs, tag=micro_batch_idx)
 
         if world.is_first_stage:
@@ -180,6 +181,11 @@ def prefill(
 
     logger.debug(f"Prefilled tokens {decoded_tokens[:, num_prompt_tokens]=}")
 
+    return {
+        "prefill_time": perf_counter() - start_prefill,
+        "prefill_tokens": batch_size * num_prompt_tokens,
+    }
+
 
 def decode(
     model: nn.Module,
@@ -187,12 +193,13 @@ def decode(
     num_prompt_tokens: int,
     micro_batch_size: int,
     **sampling_kwargs,
-) -> Tensor:
+) -> Dict:
     """
     Auto-regressively decodes tokens until max new tokens are reached. Assumes that
     the model caches are set up, the prompt is tokenized and split into micro-batches
     and the input_pos is a tensor of shape [num_prompt_tokens]. Automatically handles
-    interleaved pipelining to achieve near peak device utilization.
+    interleaved pipelining to achieve near peak device utilization. Returns a dictionary
+    of metrics.
 
     Args:
         model: Transformer
@@ -202,7 +209,7 @@ def decode(
         **sampling_kwargs: Dict of kwargs for the sample function
 
     Returns:
-        next_tokens: Tensor of shape [batch_size, num_new_tokens]
+        metrics: Dict of metrics
     """
     world, logger, comm = get_world(), get_logger(), get_comm()
     logger.debug(f"decode(model, {decoded_tokens=}, {num_prompt_tokens=}, {micro_batch_size=})")
@@ -228,83 +235,152 @@ def decode(
 
     # Single-node
     if world.size == 1:
+        time_per_token = []
         for token_idx in range(starting_pos, decoded_tokens.size(-1)):
+            time_per_micro_batch = []
             input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
             for micro_batch_idx in range(num_micro_batches):
+                start_time = perf_counter()
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
                 cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(-1)
                 logits = model_forward(model, micro_batch_idx, mask, cur_tokens, input_pos)
                 next_token = sample(logits, **sampling_kwargs)
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+                time_per_micro_batch.append(perf_counter() - start_time)
+            time_per_token.append(time_per_micro_batch)
+
         logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
-        return
 
     # Multi-node
-    # Prefill pipeline
-    recv_reqs = [None] * num_micro_batches
-    if world.is_first_stage:
-        input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
-        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-        for micro_batch_idx in range(num_micro_batches):
-            start_idx = micro_batch_idx * micro_batch_size
-            end_idx = start_idx + micro_batch_size
-            cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(-1)
-            hidden_states = model_forward(
-                model,
-                micro_batch_idx,
-                mask,
-                cur_tokens,
-                input_pos,
-            )
-            comm.isend(hidden_states, tag=micro_batch_idx)
-            recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
-            recv_start = perf_counter()
-
-    # Decode interleaved
-    next_token, hidden_states = None, None
-    for token_idx in range(starting_pos, decoded_tokens.size(-1)):
-        logger.debug(f"Decoding token {token_idx}")
-        input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
-        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+    else:
+        recv_reqs = [None] * num_micro_batches
         if world.is_first_stage:
-            input_pos += 1
-        for micro_batch_idx in range(num_micro_batches):
-            if world.is_first_stage:
+            input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+            for micro_batch_idx in range(num_micro_batches):
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
-                next_token = recv_reqs[micro_batch_idx].wait()
-                logger.debug(f"Waited for next token {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
-                decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
-            else:
-                recv_start = perf_counter()
-                hidden_states = comm.recv(tag=micro_batch_idx)
-                logger.debug(f"Waited for hidden states {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
-
-            # Skip forward and send on last iteration for first stage
-            if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
-                continue
-
-            # Forward pass
-            outputs = model_forward(
-                model,
-                micro_batch_idx,
-                mask,
-                next_token,
-                input_pos,
-                hidden_states,
-            )
-
-            if world.is_last_stage:
-                outputs = sample(outputs, **sampling_kwargs)
-
-            # Send hidden states or next token
-            comm.isend(outputs, tag=micro_batch_idx)
-
-            # Schedule next recv
-            if world.is_first_stage:
+                cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(-1)
+                hidden_states = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    cur_tokens,
+                    input_pos,
+                )
+                comm.isend(hidden_states, tag=micro_batch_idx)
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
                 recv_start = perf_counter()
 
+        # Decode interleaved
+        next_token, hidden_states = None, None
+        time_per_token = []
+        for token_idx in range(starting_pos, decoded_tokens.size(-1)):
+            time_per_micro_batch = []
+            input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+            if world.is_first_stage:
+                input_pos += 1
+            for micro_batch_idx in range(num_micro_batches):
+                start_time = perf_counter()
+                if world.is_first_stage:
+                    start_idx = micro_batch_idx * micro_batch_size
+                    end_idx = start_idx + micro_batch_size
+                    next_token = recv_reqs[micro_batch_idx].wait()
+                    logger.debug(f"Waited for next token {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
+                    decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+                else:
+                    recv_start = perf_counter()
+                    hidden_states = comm.recv(tag=micro_batch_idx)
+                    logger.debug(f"Waited for hidden states {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
+
+                # Skip forward and send on last iteration for first stage
+                if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
+                    continue
+
+                # Forward pass
+                outputs = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    next_token,
+                    input_pos,
+                    hidden_states,
+                )
+
+                if world.is_last_stage:
+                    outputs = sample(outputs, **sampling_kwargs)
+
+                # Send hidden states or next token
+                comm.isend(outputs, tag=micro_batch_idx)
+
+                # Schedule next recv
+                if world.is_first_stage:
+                    recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+                    recv_start = perf_counter()
+                time_per_micro_batch.append(perf_counter() - start_time)
+            time_per_token.append(time_per_micro_batch)
+
     logger.debug(f"Decoded tokens {decoded_tokens[:, num_prompt_tokens:]=}")
+    return {
+        "time_per_token": time_per_token,
+        "num_decode_tokens": batch_size * (decoded_tokens.size(-1) - num_prompt_tokens),
+    }
+
+
+@torch.no_grad()
+def generate(
+    model: nn.Module,
+    prompt_tokens: Tensor,
+    batch_size: int,
+    num_new_tokens: int,
+    micro_batch_size: int,
+    **sampling_kwargs,
+) -> Tuple[Tensor, Dict, Dict]:
+    """
+    Generate tokens.
+
+    Args:
+        model: Transformer
+        prompt_tokens: Tensor of shape [batch_size, num_prompt_tokens]
+        num_new_tokens: int
+        micro_batch_size: int
+        **sampling_kwargs: Dict of kwargs for the sample function
+    """
+    # Setup model cache
+    num_prompt_tokens = prompt_tokens.size(-1)
+    num_micro_batches = batch_size // micro_batch_size
+    num_total_tokens = min(num_prompt_tokens + num_new_tokens, model.config.block_size)
+    device = model.layers[0].feed_forward.w1.weight.device
+    with torch.device(device):
+        model.setup_caches(
+            num_micro_batches=num_micro_batches,
+            max_micro_batch_size=micro_batch_size,
+            max_seq_length=num_total_tokens,
+        )
+
+    # Allocate tensor for decoded tokens
+    decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
+    decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
+
+    # Prefill prompt tokens in-place
+    prefill_metrics = prefill(
+        model=model,
+        decoded_tokens=decoded_tokens,
+        micro_batch_size=micro_batch_size,
+        num_prompt_tokens=num_prompt_tokens,
+        **sampling_kwargs,
+    )
+
+    # Decode remaining tokens in-place
+    decode_metrics = decode(
+        model=model,
+        decoded_tokens=decoded_tokens,
+        micro_batch_size=micro_batch_size,
+        num_prompt_tokens=num_prompt_tokens,
+        **sampling_kwargs,
+    )
+
+    return decoded_tokens, prefill_metrics, decode_metrics

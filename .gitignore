@@ -7,6 +7,9 @@ build
 # settings
 .vscode
 
+# benchmark results
+benchmark
+
 # data
 data
 checkpoints

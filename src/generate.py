@@ -1,15 +1,13 @@
 import argparse
 import time
-from typing import Any, List
 
 import torch
-import torch.nn as nn
 from lovely_tensors import monkey_patch
 from torch.nn.attention.flex_attention import create_block_mask
 
 from comm import setup_comm
-from decode import decode, prefill
-from logger import get_logger, setup_logger
+from decode import generate
+from logger import setup_logger
 from model import get_model, get_model_shard
 from serializer import get_serializer
 from tokenizer import get_tokenizer
@@ -18,75 +16,6 @@ from world import get_world
 
 # Use lovely tensors
 monkey_patch()
-
-
-@torch.no_grad()
-def generate(
-    model: nn.Module,
-    tokenizer: Any,
-    prompt: str,
-    batch_size: int,
-    num_new_tokens: int,
-    micro_batch_size: int,
-    **sampling_kwargs,
-) -> List[str]:
-    """
-    Generate tokens.
-
-    Args:
-        model: Transformer
-        prompt_tokens: Tensor of shape [batch_size, num_prompt_tokens]
-        num_new_tokens: int
-        micro_batch_size: int
-        **sampling_kwargs: Dict of kwargs for the sample function
-    """
-    # Encode prompt
-    device = model.layers[0].feed_forward.w1.weight.device
-    prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
-    prompt_tokens = torch.tensor(
-        prompt_tokens,
-        device=device,
-    ).repeat(batch_size, 1)
-
-    get_logger().info(f"Prompt tokens: {prompt_tokens}")
-
-    # Setup model cache
-    num_prompt_tokens = prompt_tokens.size(-1)
-    num_micro_batches = batch_size // micro_batch_size
-    num_total_tokens = min(num_prompt_tokens + num_new_tokens, model.config.block_size)
-    with torch.device(device):
-        model.setup_caches(
-            num_micro_batches=num_micro_batches,
-            max_micro_batch_size=micro_batch_size,
-            max_seq_length=num_total_tokens,
-        )
-
-    # Allocate tensor for decoded tokens
-    decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
-    decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
-
-    # Prefill prompt tokens in-place
-    prefill(
-        model=model,
-        decoded_tokens=decoded_tokens,
-        micro_batch_size=micro_batch_size,
-        num_prompt_tokens=num_prompt_tokens,
-        **sampling_kwargs,
-    )
-
-    # Decode remaining tokens in-place
-    decode(
-        model=model,
-        decoded_tokens=decoded_tokens,
-        micro_batch_size=micro_batch_size,
-        num_prompt_tokens=num_prompt_tokens,
-        **sampling_kwargs,
-    )
-
-    # Decode generations
-    generations = [tokenizer.decode(decoded_tokens[i].tolist()) for i in range(batch_size)]
-
-    return generations
 
 
 def main(args: argparse.Namespace) -> None:
@@ -173,7 +102,7 @@ def main(args: argparse.Namespace) -> None:
     for sample_idx in range(-1 if args.compile else 0, args.num_samples):
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        generations = generate(
+        generations, _, _ = generate(
             model=model,
             tokenizer=tokenizer,
             prompt=args.prompt,
