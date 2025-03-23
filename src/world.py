@@ -1,11 +1,10 @@
-import os
 from typing import Optional
 
 
 class World:
-    def __init__(self):
-        self.rank = int(os.environ.get("RANK", 0))
-        self.size = int(os.environ.get("WORLD_SIZE", 1))
+    def __init__(self, rank: Optional[int] = None, size: Optional[int] = None):
+        self.rank = rank if rank is not None else 0
+        self.size = size if size is not None else 1
 
     @property
     def is_first_stage(self) -> bool:
@@ -35,4 +34,10 @@ def get_world() -> World:
     global _WORLD
     if _WORLD is None:
         _WORLD = World()
+    return _WORLD
+
+
+def setup_world(rank: int, size: int) -> None:
+    global _WORLD
+    _WORLD = World(rank, size)
     return _WORLD

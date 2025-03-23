@@ -56,6 +56,13 @@ def setup_comm(comm_backend: str, **kwargs) -> P2PCommBase:
     return _COMM
 
 
+def destroy_comm():
+    global _COMM
+    if _COMM is not None:
+        _COMM.destroy()
+        _COMM = None
+
+
 def get_comm() -> P2PCommBase:
     global _COMM
     assert _COMM is not None, "Comm not setup"
@@ -166,17 +173,19 @@ class IrohWork(WorkBase):
 class IrohP2PComm(P2PCommBase):
     """IrohNode running receiver and sender in separate processes with non-blocking API"""
 
-    def __init__(self, serializer: Serializer, num_micro_batches: int):
+    def __init__(self, serializer: Serializer, num_micro_batches: int, latency: int = 0):
         super().__init__(serializer)
         self.logger = get_logger()
-        self.node, self.num_micro_batches = None, num_micro_batches
+        self.node, self.num_micro_batches, self.latency = None, num_micro_batches, latency
         if self.world.size <= 1:
             return
         self._setup()
 
     def _setup(self):
         # Create node
-        self.node = Node.with_seed(self.num_micro_batches, seed=int(os.environ.get("IROH_SEED")))
+        seed = os.environ.get("IROH_SEED", None)
+        self.node = Node.with_seed(self.num_micro_batches, seed=int(seed) if seed is not None else None)
+        time.sleep(1)
         self.logger.info(f"Listening on {self.node.node_id()}")
 
         # Connect to remote node
@@ -184,6 +193,7 @@ class IrohP2PComm(P2PCommBase):
         if peer_id is None:
             self.logger.info("Didn't find IROH_PEER_ID environment variable, please enter the peer's public key: ")
             peer_id = input().strip()
+        self.logger.info(f"Connecting to {peer_id}")
         self.node.connect(peer_id)
 
         # Wait for connection to be established
@@ -199,7 +209,7 @@ class IrohP2PComm(P2PCommBase):
     def isend(self, tensor: torch.Tensor, tag: int, **kwargs) -> Optional[IrohWork]:
         if self.world.size <= 1:
             return None
-        return IrohWork(self.node.isend(self.serializer.serialize(tensor), tag, **kwargs), self.serializer)
+        return IrohWork(self.node.isend(self.serializer.serialize(tensor), tag, self.latency), None)
 
     def send(self, tensor: torch.Tensor, tag: int, **kwargs) -> None:
         work = self.isend(tensor, tag)
