@@ -45,7 +45,8 @@ _COMM: Optional[P2PCommBase] = None
 
 def setup_comm(comm_backend: str, **kwargs) -> P2PCommBase:
     global _COMM
-    assert _COMM is None, "Comm already setup"
+    if _COMM is not None:
+        return _COMM
     if comm_backend == "torch":
         _COMM = TorchP2PComm(**kwargs)
     elif comm_backend == "iroh":

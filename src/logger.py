@@ -8,7 +8,8 @@ _LOGGER = None
 def setup_logger(rank: int, log_level: str = "INFO"):
     """Configure multi-process logger shared across modules"""
     global _LOGGER
-    assert _LOGGER is None, "Logger already setup"
+    if _LOGGER is not None:
+        return _LOGGER
     loguru_logger.remove()  # Remove default handlers
     loguru_logger.add(
         sys.stdout,
