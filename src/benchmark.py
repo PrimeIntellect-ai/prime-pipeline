@@ -19,7 +19,7 @@ from generate import generate
 from logger import get_logger
 from setup import setup
 from utils import flatten_list, mean
-from world import get_world, setup_world
+from world import setup_world
 
 # Use lovely tensors
 monkey_patch()
@@ -75,34 +75,32 @@ def run_benchmark(
         os.environ["IROH_SEED"] = str(rank)
         os.environ["IROH_PEER_ID"] = IROH_PAIRS[(rank + 1) % world_size]
 
-    # Setup world, logger, comm and load model
-    start_setup = perf_counter()
-    model, _, prompt_tokens = setup(
-        rank=rank,
-        world_size=world_size,
-        log_level=log_level,
-        seed=seed,
-        device=device,
-        precision=precision,
-        model_name=model_name,
-        prompt=prompt,
-        compile=compile,
-        backend=backend,
-        micro_batch_size=micro_batch_size,
-        batch_size=batch_size,
-        latency=latency,
-    )
-    setup_time = {"setup_time": perf_counter() - start_setup, "compile_time": 0}
-
-    # Get world, logger, comm
-    world, logger = get_world(), get_logger()
-
     metrics = []
     desc = f"Configuration {config_idx} ({batch_size=}, {micro_batch_size=}, {backend=}, {compile=})"
     iter = range(-1 if compile else 0, num_iterations)
-    iter = tqdm(iter, desc=desc) if world.is_master else iter
+    iter = tqdm(iter, desc=desc) if rank == 0 else iter
     for sample_idx in iter:
         torch.cuda.synchronize()
+        # Setup world, logger, comm and load model
+        start_setup = perf_counter()
+        model, _, prompt_tokens = setup(
+            rank=rank,
+            world_size=world_size,
+            log_level=log_level,
+            seed=seed,
+            device=device,
+            precision=precision,
+            model_name=model_name,
+            prompt=prompt,
+            compile=compile,
+            backend=backend,
+            micro_batch_size=micro_batch_size,
+            batch_size=batch_size,
+            latency=latency,
+        )
+        setup_time = {"setup_time": perf_counter() - start_setup, "compile_time": 0}
+
+        # Generate
         start_generate = perf_counter()
         _, prefill_metrics, decode_metrics = generate(
             model=model,
@@ -112,7 +110,7 @@ def run_benchmark(
         )
         if sample_idx == -1:
             setup_time["compile_time"] = perf_counter() - start_generate
-            logger.info(f"Compiled in {setup_time['compile_time']:.2f} seconds")
+            get_logger().info(f"Compiled in {setup_time['compile_time']:.2f} seconds")
             continue
 
         # Compute metrics
@@ -129,8 +127,8 @@ def run_benchmark(
             }
         )
 
-    # Destroy communication (necessary for iroh backend, because it adjust streams to number of micro batches)
-    destroy_comm()
+        # Destroy communication (necessary for iroh backend, because it adjust streams to number of micro batches)
+        destroy_comm()
 
     return metrics
 

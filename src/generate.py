@@ -146,6 +146,7 @@ def prefill(
     wait_times = []
     forward_times = []
     prefill_times = []
+    send_reqs = []
     for micro_batch_idx in range(num_micro_batches):
         start = perf_counter()
         # Receive hidden states from previous stage
@@ -181,7 +182,7 @@ def prefill(
         logger.debug(f"Forward for token_idx={num_prompt_tokens} {micro_batch_idx=} took {forward_time * 1000:.2f}s")
 
         # Send hidden states or next token to next stage
-        comm.isend(outputs, tag=micro_batch_idx)
+        send_reqs.append(comm.isend(outputs, tag=micro_batch_idx))
 
         if world.is_first_stage:
             # Receive next token from last stage
@@ -195,6 +196,11 @@ def prefill(
                 wait_times.append(wait_time)
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
         prefill_times.append(perf_counter() - start)
+
+    # Wait for all outstanding sends
+    for send_req in send_reqs:
+        if send_req is not None:
+            send_req.wait()
 
     return {
         "times": [prefill_times],
