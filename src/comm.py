@@ -208,11 +208,13 @@ class IrohP2PComm(P2PCommBase):
     def irecv(self, tag: int, **kwargs) -> Optional[IrohWork]:
         if self.world.size <= 1:
             return None
+        self.logger.debug(f"irecv({tag=})")
         return IrohWork(self.node.irecv(tag), self.device, self.serializer)
 
     def isend(self, tensor: torch.Tensor, tag: int, **kwargs) -> Optional[IrohWork]:
         if self.world.size <= 1:
             return None
+        self.logger.debug(f"isend({tensor=}, {tag=}")
         return IrohWork(self.node.isend(self.serializer.serialize(tensor), tag, self.latency), self.device, self.serializer)
 
     def destroy(self):

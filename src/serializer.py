@@ -15,15 +15,12 @@ class Serializer(ABC):
 
 
 class PickleSerializer(Serializer):
-    def __init__(self, device: torch.device):
-        self.device = device
-
     def serialize(self, tensor: torch.Tensor) -> bytes:
         return pickle.dumps(tensor.cpu())
 
     def deserialize(self, data: bytes) -> torch.Tensor:
-        return pickle.loads(data).to(self.device)
+        return pickle.loads(data)
 
 
-def get_serializer(device: torch.device) -> Serializer:
-    return PickleSerializer(device)
+def get_serializer() -> Serializer:
+    return PickleSerializer()

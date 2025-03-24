@@ -2,7 +2,9 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Any, List
 
+import numpy as np
 import torch
 from safetensors.torch import load_file as load_safetensors_file
 
@@ -34,6 +36,15 @@ def get_precision(precision: str) -> torch.dtype:
         return torch.bfloat16
     else:
         raise NotImplementedError(f"Precision {precision} not implemented")
+
+
+def mean(values: List[float]) -> float:
+    return np.mean(values) if len(values) > 0 else 0
+
+
+def flatten_list(list_of_lists: List[List[Any]]) -> List[Any]:
+    """Flatten a list of lists into a single list."""
+    return [item for sublist in list_of_lists for item in sublist]
 
 
 def convert_model(model_name: str) -> None:

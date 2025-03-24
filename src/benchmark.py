@@ -7,7 +7,7 @@ from itertools import product
 from multiprocessing import Process
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 import torch
 from lovely_tensors import monkey_patch
@@ -18,6 +18,7 @@ from comm import destroy_comm
 from generate import generate
 from logger import get_logger
 from setup import setup
+from utils import flatten_list, mean
 from world import get_world, setup_world
 
 # Use lovely tensors
@@ -30,6 +31,21 @@ IROH_PAIRS = {
     2: "c5bbbb60e412879bbec7bb769804fa8e36e68af10d5477280b63deeaca931bed",
     3: "4f44e6c7bdfed3d9f48d86149ee3d29382cae8c83ca253e06a70be54a301828b",
 }
+
+
+# Compute decode metrics for this iteration
+def compute_metrics(metrics: Dict, warmup: bool, stage: Literal["prefill", "decode"]) -> Dict:
+    total_time = sum(flatten_list(metrics["times"][int(warmup) :]))
+    mean_forward_time = mean(flatten_list(metrics["forward_times"][int(warmup) :]))
+    mean_wait_time = mean(flatten_list(metrics["wait_times"][int(warmup) :]))
+    tps = (metrics["num_new_tokens"] - int(warmup)) / total_time
+    return {
+        f"{stage}_time": total_time,
+        f"{stage}_tps": tps,
+        f"{stage}_forward_time": mean_forward_time,
+        f"{stage}_wait_time": mean_wait_time,
+        f"{stage}_num_new_tokens": metrics["num_new_tokens"],
+    }
 
 
 def run_benchmark(
@@ -60,7 +76,7 @@ def run_benchmark(
         os.environ["IROH_PEER_ID"] = IROH_PAIRS[(rank + 1) % world_size]
 
     # Setup world, logger, comm and load model
-    t0 = perf_counter()
+    start_setup = perf_counter()
     model, _, prompt_tokens = setup(
         rank=rank,
         world_size=world_size,
@@ -76,18 +92,18 @@ def run_benchmark(
         batch_size=batch_size,
         latency=latency,
     )
-    setup_time = {"setup_time": perf_counter() - t0, "compile_time": 0}
+    setup_time = {"setup_time": perf_counter() - start_setup, "compile_time": 0}
 
     # Get world, logger, comm
     world, logger = get_world(), get_logger()
 
     metrics = []
-    desc = f"Configuration {config_idx + 1} ({batch_size=}, {micro_batch_size=}, {backend=}, {compile=})"
+    desc = f"Configuration {config_idx} ({batch_size=}, {micro_batch_size=}, {backend=}, {compile=})"
     iter = range(-1 if compile else 0, num_iterations)
     iter = tqdm(iter, desc=desc) if world.is_master else iter
     for sample_idx in iter:
         torch.cuda.synchronize()
-        start_time = perf_counter()
+        start_generate = perf_counter()
         _, prefill_metrics, decode_metrics = generate(
             model=model,
             prompt_tokens=prompt_tokens,
@@ -95,27 +111,21 @@ def run_benchmark(
             micro_batch_size=micro_batch_size,
         )
         if sample_idx == -1:
-            setup_time["compile_time"] = perf_counter() - start_time
+            setup_time["compile_time"] = perf_counter() - start_generate
             logger.info(f"Compiled in {setup_time['compile_time']:.2f} seconds")
             continue
 
-        # Compute metrics for this iteration
-        time_per_token_list = list(map(sum, decode_metrics["time_per_token"][int(warmup) :]))
-        decode_time = sum(time_per_token_list)
-        time_per_token = decode_time / len(time_per_token_list)
-        decode_tps = (decode_metrics["num_decode_tokens"] - int(warmup) * batch_size) / decode_time
+        # Compute metrics
+        computed_prefill_metrics = compute_metrics(prefill_metrics, warmup=False, stage="prefill")
+        computed_decode_metrics = compute_metrics(decode_metrics, warmup=warmup, stage="decode")
 
         metrics.append(
             {
                 "iteration": sample_idx + 1,
                 "setup_time": setup_time["setup_time"],
                 "compile_time": setup_time["compile_time"],
-                "prefill_time": prefill_metrics["prefill_time"],
-                "prefill_tokens": prefill_metrics["prefill_tokens"],
-                "decode_time": decode_time,
-                "decode_tokens": decode_metrics["num_decode_tokens"],
-                "throughput": decode_tps,
-                "time_per_token": time_per_token,
+                **computed_prefill_metrics,
+                **computed_decode_metrics,
             }
         )
 
@@ -136,6 +146,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
     }
     static_config = {
         "model_name": args.model_name,
+        "num_devices": args.num_devices,
         "prompt": args.prompt,
         "num_new_tokens": args.num_new_tokens,
         "precision": args.precision,
@@ -154,7 +165,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
 
     # Run benchmarks for each combination
     aggregated_results = []
-    for config_idx, config_combination in enumerate(dynamic_config_combinations):
+    for config_idx, config_combination in enumerate(dynamic_config_combinations, start=1):
         # Create configuration dict
         config = dict(zip(dynamic_config_names, config_combination))
 
@@ -175,6 +186,9 @@ def main(rank: int, args: argparse.Namespace) -> None:
             **config,
         )
 
+        # Ensure cache is emptied
+        torch.cuda.empty_cache()
+
         # Aggregate metrics
         def mean(values: List[float]) -> float:
             return sum(values) / len(values)
@@ -194,8 +208,8 @@ def main(rank: int, args: argparse.Namespace) -> None:
 
     # Display aggregated results
     if world.is_master:
-        headers = aggregated_results[0].keys()
-        table = [list(result.values()) for result in aggregated_results]
+        headers = ["config_idx"] + list(aggregated_results[0].keys())
+        table = [[config_idx] + list(result.values()) for config_idx, result in enumerate(aggregated_results, start=1)]
         print(tabulate(table, headers=headers))
 
         print("\nAll benchmarks completed!")

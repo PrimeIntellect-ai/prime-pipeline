@@ -98,7 +98,7 @@ def setup(
             num_prompt_tokens=num_prompt_tokens,
         )
     elif backend == "iroh":
-        serializer = get_serializer(device=device)
+        serializer = get_serializer()
         kwargs = dict(
             serializer=serializer,
             num_micro_batches=num_micro_batches,

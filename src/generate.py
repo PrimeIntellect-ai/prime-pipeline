@@ -143,11 +143,18 @@ def prefill(
     num_prompt_tokens = input_pos.size(0)
     num_micro_batches = batch_size // micro_batch_size
     next_token, hidden_states = None, None
-    start_prefill = perf_counter()
+    wait_times = []
+    forward_times = []
+    prefill_times = []
     for micro_batch_idx in range(num_micro_batches):
+        start = perf_counter()
         # Receive hidden states from previous stage
         if not world.is_first_stage:
+            start_recv = perf_counter()
             hidden_states = comm.recv(tag=micro_batch_idx, prefill=True)
+            wait_time = perf_counter() - start_recv
+            logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time:.2f}s")
+            wait_times.append(wait_time)
 
         # Get micro-batch prompt tokens
         start_idx = micro_batch_idx * micro_batch_size
@@ -155,6 +162,7 @@ def prefill(
         prompt_tokens = decoded_tokens[start_idx:end_idx, :num_prompt_tokens]
 
         # Forward pass
+        start_forward = perf_counter()
         outputs = model_forward(
             model,
             micro_batch_idx,
@@ -168,6 +176,10 @@ def prefill(
         if world.is_last_stage:
             outputs = sample(outputs, **sampling_kwargs)
 
+        forward_time = perf_counter() - start_forward
+        forward_times.append(forward_time)
+        logger.debug(f"Forward for token_idx={num_prompt_tokens} {micro_batch_idx=} took {forward_time * 1000:.2f}s")
+
         # Send hidden states or next token to next stage
         comm.isend(outputs, tag=micro_batch_idx)
 
@@ -176,12 +188,19 @@ def prefill(
             if world.size == 1:
                 next_token = outputs
             else:
+                start_recv = perf_counter()
                 next_token = comm.recv(tag=micro_batch_idx, prefill=True)
+                wait_time = perf_counter() - start_recv
+                logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time:.2f}s")
+                wait_times.append(wait_time)
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
+        prefill_times.append(perf_counter() - start)
 
     return {
-        "prefill_time": perf_counter() - start_prefill,
-        "prefill_tokens": batch_size * num_prompt_tokens,
+        "times": [prefill_times],
+        "num_new_tokens": batch_size,
+        "forward_times": [forward_times],
+        "wait_times": [wait_times],
     }
 
 
@@ -231,35 +250,45 @@ def decode(
         device=device,
     )
 
-    # Single-node
+    # Initialize async send/ recv requests and timings
     send_reqs = [None] * num_micro_batches
     recv_reqs = [None] * num_micro_batches
+    token_idxs = range(starting_pos, decoded_tokens.size(-1))
+    wait_times = [[] for _ in range(len(token_idxs))]
+    forward_times = [[] for _ in range(len(token_idxs))]
+    decode_times = [[] for _ in range(len(token_idxs))]
+
+    # Single-node
     if world.size == 1:
-        time_per_token = []
-        for token_idx in range(starting_pos, decoded_tokens.size(-1)):
-            time_per_micro_batch = []
+        for i, token_idx in enumerate(token_idxs):
             input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
             for micro_batch_idx in range(num_micro_batches):
-                start_time = perf_counter()
+                start_decode = perf_counter()
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
                 cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(-1)
+                start_forward = perf_counter()
                 logits = model_forward(model, micro_batch_idx, mask, cur_tokens, input_pos)
                 next_token = sample(logits, **sampling_kwargs)
+                forward_time = perf_counter() - start_forward
+                logger.debug(f"Forward for {token_idx=} {micro_batch_idx=} took {forward_time * 1000:.2f}ms")
+                wait_times[i].append(0)
+                forward_times[i].append(forward_time)
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
-                time_per_micro_batch.append(perf_counter() - start_time)
-            time_per_token.append(time_per_micro_batch)
-
+                decode_times[i].append(perf_counter() - start_decode)
     # Multi-node
     else:
-        if world.is_first_stage:
-            input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
-            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-            for micro_batch_idx in range(num_micro_batches):
+        # Warm-up pipeline
+        input_pos = torch.tensor([starting_pos], device=device, dtype=torch.long)
+        mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+        for micro_batch_idx in range(num_micro_batches):
+            start_decode = perf_counter()
+            if world.is_first_stage:
                 start_idx = micro_batch_idx * micro_batch_size
                 end_idx = start_idx + micro_batch_size
                 cur_tokens = decoded_tokens[start_idx:end_idx, starting_pos - 1].unsqueeze(-1)
+                start_forward = perf_counter()
                 hidden_states = model_forward(
                     model,
                     micro_batch_idx,
@@ -267,67 +296,82 @@ def decode(
                     cur_tokens,
                     input_pos,
                 )
+                forward_time = perf_counter() - start_forward
+                forward_times[0].append(forward_time)
                 send_reqs[micro_batch_idx] = comm.isend(hidden_states, tag=micro_batch_idx)
-                recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
-                recv_start = perf_counter()
+            recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+            start_recv = perf_counter()
 
-        # Decode interleaved
+        # Interleaved decode pipeline schedule
         next_token, hidden_states = None, None
-        time_per_token = []
-        for token_idx in range(starting_pos, decoded_tokens.size(-1)):
-            time_per_micro_batch = []
+        for i, token_idx in enumerate(token_idxs):
             input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
-            if world.is_first_stage:
-                input_pos += 1
             for micro_batch_idx in range(num_micro_batches):
-                start_time = perf_counter()
+                # Receive next token or hidden states
                 if world.is_first_stage:
                     start_idx = micro_batch_idx * micro_batch_size
                     end_idx = start_idx + micro_batch_size
                     next_token = recv_reqs[micro_batch_idx].wait()
-                    logger.debug(f"Waited for next token {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
                     decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+                    decode_times[i].append(perf_counter() - start_decode)
                 else:
-                    recv_start = perf_counter()
-                    hidden_states = comm.recv(tag=micro_batch_idx)
-                    logger.debug(f"Waited for hidden states {micro_batch_idx}: {perf_counter() - recv_start:.2f} seconds")
+                    # start_recv = perf_counter()
+                    # hidden_states = comm.recv(tag=micro_batch_idx)
+                    hidden_states = recv_reqs[micro_batch_idx].wait()
+                start_decode = perf_counter()
+                wait_time = perf_counter() - start_recv
+                wait_times[i].append(wait_time)
+                logger.debug(f"Wait for recv {token_idx=} {micro_batch_idx=} took {wait_time * 1000:.2f}ms")
 
                 # Skip forward and send on last iteration for first stage
-                if world.is_first_stage and token_idx >= decoded_tokens.size(-1) - 1:
-                    continue
+                if world.is_first_stage and token_idx == decoded_tokens.size(-1) - 1:
+                    break
 
                 # Forward pass
+                start_forward = perf_counter()
                 outputs = model_forward(
                     model,
                     micro_batch_idx,
                     mask,
                     next_token,
-                    input_pos,
+                    input_pos + 1 if world.is_first_stage else input_pos,  # First stage is one step ahead
                     hidden_states,
                 )
 
+                # Sample next token on last stage
                 if world.is_last_stage:
                     outputs = sample(outputs, **sampling_kwargs)
+
+                forward_time = perf_counter() - start_forward
+                forward_times[i + 1 if world.is_first_stage else i].append(forward_time)
+                logger.debug(f"Forward {token_idx=} {micro_batch_idx=} took {forward_time * 1000:.2f}ms")
 
                 # Send hidden states or next token
                 send_reqs[micro_batch_idx] = comm.isend(outputs, tag=micro_batch_idx)
 
-                # Schedule next recv
-                if world.is_first_stage:
-                    recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
-                    recv_start = perf_counter()
-                time_per_micro_batch.append(perf_counter() - start_time)
-            time_per_token.append(time_per_micro_batch)
+                # Record decode time
+                if not world.is_first_stage:
+                    decode_times[i].append(perf_counter() - start_decode)
 
-    # Finsish all outstanding sends
+                # Skip recv on last iteration
+                if not world.is_first_stage and token_idx == decoded_tokens.size(-1) - 1:
+                    break
+
+                # Schedule next recv
+                recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
+                start_recv = perf_counter()
+
+    # Finish all outstanding sends
     for send_req in send_reqs:
         if send_req:
             send_req.wait()
 
     return {
-        "time_per_token": time_per_token,
-        "num_decode_tokens": batch_size * (decoded_tokens.size(-1) - num_prompt_tokens),
+        "times": decode_times,
+        "forward_times": forward_times,
+        "wait_times": wait_times,
+        "num_new_tokens": batch_size * len(token_idxs),
     }
 
 
