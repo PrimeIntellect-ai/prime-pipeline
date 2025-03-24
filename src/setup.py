@@ -103,6 +103,7 @@ def setup(
             serializer=serializer,
             num_micro_batches=num_micro_batches,
             latency=latency,
+            device=device,
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
