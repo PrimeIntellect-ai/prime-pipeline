@@ -156,7 +156,8 @@ class TorchP2PComm(P2PCommBase):
         shape = (self.bwd_shape, self.bwd_prefill_shape) if self.world.is_first_stage else (self.fwd_shape, self.fwd_prefill_shape)
         dtype = self.bwd_dtype if self.world.is_first_stage else self.fwd_dtype
         src = self.world.last_stage_rank if self.world.is_first_stage else self.world.rank - 1
-        tensor = torch.empty(shape[int(prefill)], dtype=dtype, device="cpu")
+        # TODO: Gloo complains if initialized as torch.empty (performance hit?)
+        tensor = torch.zeros(shape[int(prefill)], dtype=dtype, device="cpu")
         self.logger.debug(f"irecv({tensor=}, {tag=}, {src=})")
         return TorchWork(tensor, dist.irecv(tensor, src=src, tag=tag), self.device)
 
@@ -218,6 +219,4 @@ class IrohP2PComm(P2PCommBase):
         return IrohWork(self.node.isend(self.serializer.serialize(tensor), tag, self.latency), self.device, self.serializer)
 
     def destroy(self):
-        if self.world.size <= 1:
-            return
-        self.node.close()
+        pass  # TODO: Fix

@@ -154,7 +154,7 @@ def prefill(
             start_recv = perf_counter()
             hidden_states = comm.recv(tag=micro_batch_idx, prefill=True)
             wait_time = perf_counter() - start_recv
-            logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time:.2f}s")
+            logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time * 1000:.2f}ms")
             wait_times.append(wait_time)
 
         # Get micro-batch prompt tokens
@@ -186,14 +186,11 @@ def prefill(
 
         if world.is_first_stage:
             # Receive next token from last stage
-            if world.size == 1:
-                next_token = outputs
-            else:
-                start_recv = perf_counter()
-                next_token = comm.recv(tag=micro_batch_idx, prefill=True)
-                wait_time = perf_counter() - start_recv
-                logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time:.2f}s")
-                wait_times.append(wait_time)
+            start_recv = perf_counter()
+            next_token = comm.recv(tag=micro_batch_idx, prefill=True)
+            wait_time = perf_counter() - start_recv
+            logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time * 1000:.2f}ms")
+            wait_times.append(wait_time)
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
         prefill_times.append(perf_counter() - start)
 
@@ -332,7 +329,7 @@ def decode(
 
                 # Skip forward and send on last iteration for first stage
                 if world.is_first_stage and token_idx == decoded_tokens.size(-1) - 1:
-                    break
+                    continue
 
                 # Forward pass
                 start_forward = perf_counter()
@@ -362,7 +359,7 @@ def decode(
 
                 # Skip recv on last iteration
                 if not world.is_first_stage and token_idx == decoded_tokens.size(-1) - 1:
-                    break
+                    continue
 
                 # Schedule next recv
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)

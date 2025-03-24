@@ -51,6 +51,7 @@ def main(args: argparse.Namespace) -> None:
             logger.info(f"Compiled in {time.perf_counter() - start_time:.2f} seconds")
             continue
 
+        logger.debug(f"Decoded tokens: {decoded_tokens.tolist()}")
         if world.is_master:
             for batch_idx, generation in enumerate(decoded_tokens):
                 logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist())}")
