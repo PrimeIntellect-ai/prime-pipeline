@@ -59,7 +59,7 @@ def run_benchmark(
     prompt: str,
     num_new_tokens: int,
     batch_size: int,
-    micro_batch_size: int,
+    num_micro_batches: int,
     device: str,
     precision: str,
     backend: str,
@@ -91,7 +91,7 @@ def run_benchmark(
         prompt=prompt,
         compile=compile,
         backend=backend,
-        micro_batch_size=micro_batch_size,
+        num_micro_batches=num_micro_batches,
         batch_size=batch_size,
         latency=latency,
     )
@@ -150,6 +150,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
     timestamp = {
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()[:7],
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "gpu": torch.cuda.get_device_name(),
     }
     static_config = {
         "model_name": args.model_name,
@@ -245,11 +246,11 @@ if __name__ == "__main__":
     # Combination arguments
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1], help="Batch size.")
     parser.add_argument(
-        "--micro-batch-size",
+        "--num-micro-batches",
         type=int,
         nargs="+",
-        default=[0],
-        help="Number of micro batches. 0 to set to batch size.",
+        default=[1],
+        help="Number of micro batches.",
     )
     parser.add_argument(
         "--backend",

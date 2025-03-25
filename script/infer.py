@@ -30,7 +30,7 @@ def main(args: argparse.Namespace) -> None:
         prompt=args.prompt,
         compile=args.compile,
         backend=args.backend,
-        micro_batch_size=args.micro_batch_size,
+        num_micro_batches=args.num_micro_batches,
         batch_size=args.batch_size,
     )
 
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Input prompt.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size.")
     parser.add_argument(
-        "--micro-batch-size",
+        "--num-micro-batches",
         type=int,
         default=1,
         help="Number of micro-batches.",

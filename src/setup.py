@@ -23,7 +23,7 @@ def setup(
     prompt: str,
     compile: bool,
     backend: str,
-    micro_batch_size: int,
+    num_micro_batches: int,
     batch_size: int,
     latency: Optional[int] = None,  # Only set for benchmark
 ) -> Tuple:
@@ -79,8 +79,9 @@ def setup(
 
     # Setup communication
     num_prompt_tokens = prompt_tokens.size(-1)
-    micro_batch_size = micro_batch_size if micro_batch_size > 0 else batch_size
-    num_micro_batches = batch_size // micro_batch_size
+    assert batch_size > num_micro_batches, "Batch size must be larger than number of micro batches"
+    assert batch_size % num_micro_batches == 0, f"Batch size {batch_size} must be divisible by number of micro batches {num_micro_batches}"
+    micro_batch_size = batch_size // num_micro_batches 
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)
     tokens_shape = (micro_batch_size, 1)
     hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
