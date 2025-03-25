@@ -20,7 +20,7 @@ CUDA_TOKENS = [1, 15043, 29892, 590, 1024, 338, 518, 1170, 1402, 322, 306, 626, 
 
 
 def test_single_node_single_batch(backend: str, device: str):
-    model, _, prompt_tokens = setup(
+    model, _, prompt_tokens, _ = setup(
         rank=0,
         world_size=1,
         log_level="CRITICAL",
@@ -33,6 +33,7 @@ def test_single_node_single_batch(backend: str, device: str):
         backend=backend,
         micro_batch_size=1,
         batch_size=1,
+        dummy=False,
     )
 
     decoded_tokens, _, _ = generate(model, prompt_tokens, num_new_tokens=3, micro_batch_size=1)
@@ -46,7 +47,7 @@ BATCH_CUDA_TOKENS = [[1, 15043, 29892, 590, 1024, 338, 2259, 29892, 322], [1, 15
 
 
 def test_single_node_multiple_batches(backend: str, device: str):
-    model, _, prompt_tokens = setup(
+    model, _, prompt_tokens, _ = setup(
         rank=0,
         world_size=1,
         log_level="CRITICAL",
@@ -59,6 +60,7 @@ def test_single_node_multiple_batches(backend: str, device: str):
         backend=backend,
         micro_batch_size=1,
         batch_size=2,
+        dummy=False,
     )
 
     decoded_tokens, _, _ = generate(model, prompt_tokens, num_new_tokens=3, micro_batch_size=1)

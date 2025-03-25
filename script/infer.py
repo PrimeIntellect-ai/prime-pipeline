@@ -18,7 +18,7 @@ monkey_patch()
 
 def main(args: argparse.Namespace) -> None:
     # Setup
-    model, tokenizer, prompt_tokens = setup(
+    model, tokenizer, prompt_tokens, micro_batch_size = setup(
         rank=int(os.environ.get("RANK", 0)),
         world_size=int(os.environ.get("WORLD_SIZE", 1)),
         log_level=args.log_level,
@@ -45,7 +45,7 @@ def main(args: argparse.Namespace) -> None:
             model=model,
             prompt_tokens=prompt_tokens,
             num_new_tokens=args.num_new_tokens,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=micro_batch_size,
             temperature=args.temperature,
             top_k=args.top_k,
         )

@@ -79,6 +79,7 @@ def setup(
 
     # Setup communication
     num_prompt_tokens = prompt_tokens.size(-1)
+    micro_batch_size = micro_batch_size if micro_batch_size > 0 else batch_size
     num_micro_batches = batch_size // micro_batch_size
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)
     tokens_shape = (micro_batch_size, 1)
@@ -105,4 +106,4 @@ def setup(
         raise ValueError(f"Invalid backend: {backend}")
     setup_comm(backend, **kwargs)
 
-    return model, tokenizer, prompt_tokens
+    return model, tokenizer, prompt_tokens, micro_batch_size

@@ -79,7 +79,7 @@ def run_benchmark(
 
     # Setup world, logger, comm and load model
     start_setup = perf_counter()
-    model, _, prompt_tokens = setup(
+    model, _, prompt_tokens, micro_batch_size = setup(
         rank=rank,
         world_size=world_size,
         log_level=log_level,
@@ -131,6 +131,9 @@ def run_benchmark(
 
     # Destroy communication (necessary for iroh backend, because it adjusts streams to number of micro batches)
     destroy_comm()
+
+    # Clear cuda cache
+    torch.cuda.empty_cache()
 
     return metrics
 
@@ -239,8 +242,8 @@ if __name__ == "__main__":
         "--micro-batch-size",
         type=int,
         nargs="+",
-        default=[1],
-        help="Number of micro batches.",
+        default=[0],
+        help="Number of micro batches. 0 to set to batch size.",
     )
     parser.add_argument(
         "--backend",
