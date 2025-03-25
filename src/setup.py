@@ -3,13 +3,13 @@ from typing import Optional, Tuple
 
 import torch
 
-from comm import setup_comm
-from logger import setup_logger
-from model import get_model, get_model_shard
-from serializer import get_serializer
-from tokenizer import get_tokenizer
-from utils import get_device, get_precision, seed_everything
-from world import setup_world
+from .comm import setup_comm
+from .logger import setup_logger
+from .model import get_model, get_model_shard
+from .serializer import get_serializer
+from .tokenizer import get_tokenizer
+from .utils import get_device, get_precision, seed_everything
+from .world import setup_world
 
 
 def setup(

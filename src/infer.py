@@ -5,11 +5,11 @@ import time
 import torch
 from lovely_tensors import monkey_patch
 
-from comm import get_comm
-from generate import generate
-from logger import get_logger
-from setup import setup
-from world import get_world
+from .comm import get_comm
+from .generate import generate
+from .logger import get_logger
+from .setup import setup
+from .world import get_world
 
 # Use lovely tensors
 monkey_patch()

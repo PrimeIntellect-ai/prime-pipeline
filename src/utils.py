@@ -8,8 +8,8 @@ import numpy as np
 import torch
 from safetensors.torch import load_file as load_safetensors_file
 
-from model import ModelArgs
-from world import World
+from .model import ModelArgs
+from .world import World
 
 
 def seed_everything(seed: int) -> None:

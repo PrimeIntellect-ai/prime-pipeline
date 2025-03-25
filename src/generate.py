@@ -8,9 +8,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from comm import get_comm
-from logger import get_logger
-from world import get_world
+from .comm import get_comm
+from .logger import get_logger
+from .world import get_world
 
 # Setup compile flags
 torch._inductor.config.coordinate_descent_tuning = True
@@ -186,11 +186,14 @@ def prefill(
 
         if world.is_first_stage:
             # Receive next token from last stage
-            start_recv = perf_counter()
-            next_token = comm.recv(tag=micro_batch_idx, prefill=True)
-            wait_time = perf_counter() - start_recv
-            logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time * 1000:.2f}ms")
-            wait_times.append(wait_time)
+            if world.size == 1:
+                next_token = outputs
+            else:
+                start_recv = perf_counter()
+                next_token = comm.recv(tag=micro_batch_idx, prefill=True)
+                wait_time = perf_counter() - start_recv
+                logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time:.2f}s")
+                wait_times.append(wait_time)
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
         prefill_times.append(perf_counter() - start)
 

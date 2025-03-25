@@ -218,7 +218,7 @@ class Transformer(nn.Module):
 
         from huggingface_hub import snapshot_download
 
-        from utils import convert_model
+        from .utils import convert_model
 
         with torch.device("meta"):
             model = cls(ModelArgs.from_name(model_name))

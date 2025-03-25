@@ -14,12 +14,12 @@ from lovely_tensors import monkey_patch
 from tabulate import tabulate
 from tqdm import tqdm
 
-from comm import destroy_comm
-from generate import generate
-from logger import get_logger
-from setup import setup
-from utils import flatten_list, mean
-from world import setup_world
+from .comm import destroy_comm
+from .generate import generate
+from .logger import get_logger
+from .setup import setup
+from .utils import flatten_list, mean
+from .world import setup_world
 
 # Use lovely tensors
 monkey_patch()

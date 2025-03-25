@@ -7,9 +7,9 @@ import torch
 import torch.distributed as dist
 from iroh_py import Node, RecvWork, SendWork
 
-from logger import get_logger
-from serializer import Serializer
-from world import get_world
+from .logger import get_logger
+from .serializer import Serializer
+from .world import get_world
 
 
 class WorkBase(ABC):
