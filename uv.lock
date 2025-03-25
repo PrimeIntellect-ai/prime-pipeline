@@ -12,6 +12,19 @@ wheels = [
 ]
 
 [[package]]
+name = "autorootcwd"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyrootutils" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cf/81/e1d437b397a3198f973a9875a5dfd37e35fdf90d3ffd5273fd1ca896d00c/autorootcwd-1.0.1.tar.gz", hash = "sha256:65ebae35478592ef453b29c6317fb8b6757f5dc6351877c85bf74d85491590bf", size = 1552 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5d/cf/ced2cef6152c4c14afa1ead49a4d2805fdfbfa3eb6496d3bb0a4931ab1b2/autorootcwd-1.0.1-py3-none-any.whl", hash = "sha256:418600077572488f5c16f729835852e3a5e0f76f2fbd5d599fb6be0128e131f5", size = 1764 },
+]
+
+[[package]]
 name = "blobfile"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -779,6 +792,7 @@ name = "pipelined-gpt-fast"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "autorootcwd" },
     { name = "blobfile" },
     { name = "dotenv" },
     { name = "iroh-py" },
@@ -801,6 +815,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "autorootcwd", specifier = ">=1.0.1" },
     { name = "blobfile" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "iroh-py", git = "https://github.com/primeintellect-ai/iroh_py.git?rev=a747724" },
@@ -894,6 +909,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8b/1a/3544f4f299a47911c2ab3710f534e52fea62a633c96806995da5d25be4b2/pyparsing-3.2.1.tar.gz", hash = "sha256:61980854fd66de3a90028d679a954d5f2623e83144b5afe5ee86f43d762e5f0a", size = 1067694 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1c/a7/c8a2d361bf89c0d9577c934ebb7421b25dc84bf3a8e3ac0a40aed9acc547/pyparsing-3.2.1-py3-none-any.whl", hash = "sha256:506ff4f4386c4cec0590ec19e6302d3aedb992fdc02c761e90416f158dacf8e1", size = 107716 },
+]
+
+[[package]]
+name = "pyrootutils"
+version = "1.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/7d/c5f3fb44dc98a72249a17a49e28bce4aaa6758ce9e37e77648cdc1857baf/pyrootutils-1.0.4.tar.gz", hash = "sha256:f58aac67147bbab20938b7b783cb2f4670d6329a33c6640233854976538fc5f2", size = 5133 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1c/6f/ed601aec632d908b86adbad0e1cc712f7073faf697134fb0465a3fbcc512/pyrootutils-1.0.4-py3-none-any.whl", hash = "sha256:8bbf25425278693168ae03b167aa6509422dc21853a6ee01d5d5e40601a89f90", size = 5831 },
 ]
 
 [[package]]

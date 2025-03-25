@@ -2,14 +2,15 @@ import argparse
 import os
 import time
 
+import autorootcwd  # noqa: F401
 import torch
 from lovely_tensors import monkey_patch
 
-from .comm import get_comm
-from .generate import generate
-from .logger import get_logger
-from .setup import setup
-from .world import get_world
+from src.comm import get_comm
+from src.generate import generate
+from src.logger import get_logger
+from src.setup import setup
+from src.world import get_world
 
 # Use lovely tensors
 monkey_patch()
@@ -54,7 +55,7 @@ def main(args: argparse.Namespace) -> None:
         logger.debug(f"Decoded tokens: {decoded_tokens.tolist()}")
         if world.is_master:
             for batch_idx, generation in enumerate(decoded_tokens):
-                logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist())}")
+                logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist(), skip_special_tokens=True)}")
 
     # Destroy communication
     comm.destroy()
