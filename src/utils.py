@@ -7,6 +7,7 @@ from typing import Any, List
 import numpy as np
 import torch
 from safetensors.torch import load_file as load_safetensors_file
+from transformers import AutoTokenizer
 
 from .model import ModelArgs
 from .world import World
@@ -36,6 +37,10 @@ def get_precision(precision: str) -> torch.dtype:
         return torch.bfloat16
     else:
         raise NotImplementedError(f"Precision {precision} not implemented")
+
+
+def get_tokenizer(model_name):
+    return AutoTokenizer.from_pretrained(model_name)
 
 
 def mean(values: List[float]) -> float:

@@ -7,8 +7,7 @@ from .comm import setup_comm
 from .logger import setup_logger
 from .model import get_model, get_model_shard
 from .serializer import get_serializer
-from .tokenizer import get_tokenizer
-from .utils import get_device, get_precision, seed_everything
+from .utils import get_device, get_precision, get_tokenizer, seed_everything
 from .world import setup_world
 
 
@@ -75,11 +74,7 @@ def setup(
     tokenizer = get_tokenizer(model_name=model_name)
 
     # Encode prompt (batch_size, num_prompt_tokens)
-    prompt_tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
-    prompt_tokens = torch.tensor(
-        prompt_tokens,
-        device=device,
-    ).repeat(batch_size, 1)
+    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(device).repeat(batch_size, 1)
 
     # Setup communication
     num_prompt_tokens = prompt_tokens.size(-1)

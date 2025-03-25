@@ -1,11 +1,5 @@
-import sys
-from pathlib import Path
-
+import autorootcwd  # noqa: F401
 import pytest
-
-# Add project root to path
-project_root = str(Path(__file__).parent.parent)
-sys.path.append(project_root)
 
 from src.generate import generate  # noqa: E402
 from src.setup import setup  # noqa: E402
