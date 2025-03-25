@@ -1,3 +1,4 @@
+import os
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -236,7 +237,8 @@ class Transformer(nn.Module):
 
         # Search for .pth file in checkpoints/model_name directory
         name = "dummy" if dummy else "model"
-        model_path = Path(f"/ephemeral/{model_name}/{name}.pth")
+        cache_dir = os.environ.get("CACHE_DIR", Path.cwd() / "checkpoints")
+        model_path = Path(f"{cache_dir}/{model_name}/{name}.pth")
         if not model_path.exists():
             if dummy:
                 with torch.no_grad():

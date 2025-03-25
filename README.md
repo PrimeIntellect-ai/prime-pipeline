@@ -53,9 +53,10 @@ git clone git@github.com:PrimeIntellect-ai/pipelined-gpt-fast.git && cd pipeline
 uv sync
 ```
 
-Also, if you plan to use a private model, you will need to set the `HF_TOKEN` environment variable. To do this, run 
+Also, if you plan to use a private model, you will need to set the `HF_TOKEN` environment variable. Also, we recommend setting the `CACHE_DIR` environment variable to a local directory with enough disk space to store the model weights.
 
 ```bash
+export CACHE_DIR=<path-to-cache-dir>
 export HF_TOKEN=<your-token>
 ```
 
