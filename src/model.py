@@ -62,6 +62,17 @@ MODEL_REGISTRY = {
             original_max_position_embeddings=8192,
         ),
     ),
+    "qwen/qwq-32b": dict(
+        block_size=40960,
+        n_layer=64,
+        n_head=40,
+        n_local_heads=8,
+        dim=5120,
+        intermediate_size=27648,
+        vocab_size=152064,
+        rope_base=10000,
+        rope_scaling=None,
+    ),
 }
 
 
@@ -213,7 +224,7 @@ class Transformer(nn.Module):
         return logits
 
     @classmethod
-    def from_name(cls, model_name: str) -> "Transformer":
+    def from_name(cls, model_name: str, dummy: bool = False) -> "Transformer":
         from pathlib import Path
 
         from huggingface_hub import snapshot_download
@@ -224,17 +235,23 @@ class Transformer(nn.Module):
             model = cls(ModelArgs.from_name(model_name))
 
         # Search for .pth file in checkpoints/model_name directory
-        model_path = Path(f"/ephemeral/{model_name}/model.pth")
+        name = "dummy" if dummy else "model"
+        model_path = Path(f"/ephemeral/{model_name}/{name}.pth")
         if not model_path.exists():
-            # Download the model and convert it to a .pth file
-            if not model_path.parent.exists():
-                snapshot_download(model_name, local_dir=model_path.parent, ignore_patterns=["*.pth"])
-            convert_model(model_name)
+            if dummy:
+                with torch.no_grad():
+                    model = cls(ModelArgs.from_name(model_name)).to(dtype=torch.bfloat16)
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), model_path)
+            else:
+                # Download the model and convert it to a .pth file
+                if not model_path.parent.exists():
+                    snapshot_download(model_name, local_dir=model_path.parent, ignore_patterns=["*.pth"])
+                convert_model(model_name)
 
         state_dict = torch.load(str(model_path), mmap=True, weights_only=True)
         model.load_state_dict(state_dict, assign=True)
-        model = model.eval()
-        return model
+        return model.eval()
 
 
 class TransformerBlock(nn.Module):
@@ -425,14 +442,16 @@ class TransformerShard(Transformer):
         return list(range(start_layer, start_layer + layers_per_gpu[stage]))
 
 
-def get_model(model_name: str, device: torch.device, precision: torch.dtype) -> nn.Module:
+def get_model(model_name: str, device: torch.device, precision: torch.dtype, dummy: bool = False) -> nn.Module:
     """Factory function to get the appropriate model based on the model name."""
-    return Transformer.from_name(model_name).to(device=device, dtype=precision)
+    return Transformer.from_name(model_name, dummy=dummy).to(device=device, dtype=precision)
 
 
-def get_model_shard(model_name: str, rank: int, world_size: int, device: torch.device, precision: torch.dtype) -> TransformerShard:
+def get_model_shard(
+    model_name: str, rank: int, world_size: int, device: torch.device, precision: torch.dtype, dummy: bool = False
+) -> TransformerShard:
     """Factory function to get the appropriate model shard based on the model name."""
-    return TransformerShard(rank, world_size, get_model(model_name, "cpu", precision)).to(device=device)
+    return TransformerShard(rank, world_size, get_model(model_name, "cpu", precision, dummy)).to(device=device)
 
 
 if __name__ == "__main__":

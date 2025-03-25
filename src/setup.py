@@ -19,6 +19,7 @@ def setup(
     device: str,
     precision: str,
     model_name: str,
+    dummy: bool,
     prompt: str,
     compile: bool,
     backend: str,
@@ -52,10 +53,10 @@ def setup(
     # Load model
     t0 = perf_counter()
     if world.size == 1:
-        model = get_model(model_name=model_name, device=device, precision=precision)
+        model = get_model(model_name=model_name, device=device, precision=precision, dummy=dummy)
         logger.info(f"Loaded model in {perf_counter() - t0:.02f} seconds")
     else:
-        model = get_model_shard(model_name=model_name, rank=rank, world_size=world_size, device=device, precision=precision)
+        model = get_model_shard(model_name=model_name, rank=rank, world_size=world_size, device=device, precision=precision, dummy=dummy)
         logger.info(f"Loaded model shard in {perf_counter() - t0:.02f} seconds")
 
     # Compile model

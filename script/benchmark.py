@@ -54,6 +54,7 @@ def run_benchmark(
     rank: int,
     world_size: int,
     model_name: str,
+    dummy: bool,
     num_iterations: int,
     prompt: str,
     num_new_tokens: int,
@@ -86,6 +87,7 @@ def run_benchmark(
         device=device,
         precision=precision,
         model_name=model_name,
+        dummy=dummy,
         prompt=prompt,
         compile=compile,
         backend=backend,
@@ -173,6 +175,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
             rank=rank,
             world_size=args.num_devices,
             model_name=args.model_name,
+            dummy=args.dummy,
             num_iterations=args.num_iterations,
             prompt=args.prompt,
             num_new_tokens=args.num_new_tokens,
@@ -227,6 +230,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1234, help="Seed for reproducibility.")
     parser.add_argument("--log-level", type=str, default="CRITICAL", help="Log level.")
     parser.add_argument("--warmup", type=bool, default=True, help="Whether to exclude the first iteration from the metrics.")
+    parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
     parser.add_argument("--save", action="store_true", help="Save results to CSV.")
 
     # Combination arguments

@@ -179,7 +179,7 @@ def prefill(
 
         forward_time = perf_counter() - start_forward
         forward_times.append(forward_time)
-        logger.debug(f"Forward for token_idx={num_prompt_tokens} {micro_batch_idx=} took {forward_time * 1000:.2f}s")
+        logger.debug(f"Forward for token_idx={num_prompt_tokens} {micro_batch_idx=} took {forward_time * 1000:.2f}ms")
 
         # Send hidden states or next token to next stage
         send_reqs.append(comm.isend(outputs, tag=micro_batch_idx))
@@ -192,7 +192,7 @@ def prefill(
                 start_recv = perf_counter()
                 next_token = comm.recv(tag=micro_batch_idx, prefill=True)
                 wait_time = perf_counter() - start_recv
-                logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time:.2f}s")
+                logger.debug(f"Wait for recv {micro_batch_idx=} took {wait_time * 1000:.2f}ms")
                 wait_times.append(wait_time)
             decoded_tokens[start_idx:end_idx, num_prompt_tokens] = next_token.squeeze()
         prefill_times.append(perf_counter() - start)

@@ -26,6 +26,7 @@ def main(args: argparse.Namespace) -> None:
         device=args.device,
         precision=args.precision,
         model_name=args.model_name,
+        dummy=args.dummy,
         prompt=args.prompt,
         compile=args.compile,
         backend=args.backend,
@@ -108,4 +109,5 @@ if __name__ == "__main__":
         default="torch",
         help="Either `torch` or `iroh`.",
     )
+    parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
     main(parser.parse_args())
