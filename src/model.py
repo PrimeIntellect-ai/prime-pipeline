@@ -231,6 +231,9 @@ class Transformer(nn.Module):
         from huggingface_hub import snapshot_download
 
         from .utils import convert_model
+        from .logger import get_logger
+
+        logger = get_logger()
 
         with torch.device("meta"):
             model = cls(ModelArgs.from_name(model_name))
@@ -241,14 +244,18 @@ class Transformer(nn.Module):
         model_path = Path(f"{cache_dir}/{model_name}/{name}.pth")
         if not model_path.exists():
             if dummy:
+                logger.info(f"Creating dummy model for {model_name}")
                 with torch.no_grad():
                     model = cls(ModelArgs.from_name(model_name)).to(dtype=torch.bfloat16)
                 model_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Saving dummy model to {model_path}")
                 torch.save(model.state_dict(), model_path)
             else:
                 # Download the model and convert it to a .pth file
+                logger.info(f"Downloading model {model_name}")
                 if not model_path.parent.exists():
                     snapshot_download(model_name, local_dir=model_path.parent, ignore_patterns=["*.pth"])
+                logger.info(f"Converting model {model_name}")
                 convert_model(model_name)
 
         state_dict = torch.load(str(model_path), mmap=True, weights_only=True)

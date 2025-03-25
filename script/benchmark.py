@@ -20,7 +20,7 @@ from src.generate import generate
 from src.logger import get_logger
 from src.setup import setup
 from src.utils import flatten_list, mean
-from src.world import setup_world
+from src.world import setup_world, get_world
 
 # Use lovely tensors
 monkey_patch()
@@ -98,9 +98,10 @@ def run_benchmark(
     setup_time = {"setup_time": perf_counter() - start_setup, "compile_time": 0}
 
     metrics = []
+    world = get_world()
     desc = f"Configuration {config_idx} ({batch_size=}, {micro_batch_size=}, {backend=}, {compile=})"
     iter = range(-1 if compile else 0, num_iterations)
-    iter = tqdm(iter, desc=desc) if rank == 0 else iter
+    iter = tqdm(iter, desc=desc) if world.is_master else iter
     for sample_idx in iter:
         torch.cuda.synchronize()
         start_generate = perf_counter()
@@ -121,9 +122,12 @@ def run_benchmark(
 
         metrics.append(
             {
+                "rank": rank,
                 "iteration": sample_idx + 1,
                 "setup_time": setup_time["setup_time"],
                 "compile_time": setup_time["compile_time"],
+                "prefill_metrics": prefill_metrics,
+                "decode_metrics": decode_metrics,
                 **computed_prefill_metrics,
                 **computed_decode_metrics,
             }
@@ -162,8 +166,8 @@ def main(rank: int, args: argparse.Namespace) -> None:
     dynamic_config_combinations = list(product(*list_args.values()))
     dynamic_config_names = list(list_args.keys())
 
+    file_path = Path(f"benchmark/{args.model_name}.jsonl")
     if world.is_master and args.save:
-        file_path = Path(f"benchmark/{args.model_name}.jsonl")
         os.makedirs(file_path.parent, exist_ok=True)
 
     # Run benchmarks for each combination
@@ -197,18 +201,20 @@ def main(rank: int, args: argparse.Namespace) -> None:
         def mean(values: List[float]) -> float:
             return sum(values) / len(values)
 
-        aggregated_metrics = {key: mean([result[key] for result in metrics]) for key in metrics[0].keys()}
-        aggregated_metrics.pop("iteration")
-        aggregated_results.append(aggregated_metrics)
-
         # Extend metrics with static and dynamic configuration
         metrics = [{**timestamp, **static_config, **config, **metric} for metric in metrics]
 
         # Save results
-        if world.is_master and args.save:
+        if args.save:
             with open(file_path, "a") as f:
                 for metric in metrics:
                     f.write(json.dumps(metric) + "\n")
+
+        # Aggregate most relevant metrics
+        metrics_to_aggregate = ["setup_time", "compile_time", "prefill_time", "decode_time", "prefill_tps", "decode_tps"]
+        aggregated_metrics = {key: mean([result[key] for result in metrics]) for key in metrics_to_aggregate}
+        aggregated_results.append(aggregated_metrics)
+
 
     # Display aggregated results
     if world.is_master:
