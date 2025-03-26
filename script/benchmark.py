@@ -29,8 +29,8 @@ monkey_patch()
 IROH_PAIRS = {
     0: "ee1aa49a4459dfe813a3cf6eb882041230c7b2558469de81f87c9bf23bf10a03",
     1: "ff87a0b0a3c7c0ce827e9cada5ff79e75a44a0633bfcb5b50f99307ddb26b337",
-    2: "c5bbbb60e412879bbec7bb769804fa8e36e68af10d5477280b63deeaca931bed",
-    3: "4f44e6c7bdfed3d9f48d86149ee3d29382cae8c83ca253e06a70be54a301828b",
+    2: "191fc38f134aaf1b7fdb1f86330b9d03e94bd4ba884f490389de964448e89b3f",
+    3: "c5bbbb60e412879bbec7bb769804fa8e36e68af10d5477280b63deeaca931bed",
 }
 
 
@@ -68,6 +68,7 @@ def run_benchmark(
     warmup: bool,
     seed: int,
     log_level: str,
+    **kwargs
 ) -> Dict:
     # Populate environment variables for multi-node setup
     assert rank in IROH_PAIRS, f"Node {rank} is not in the list of known nodes: {IROH_PAIRS.keys()}"
@@ -99,9 +100,8 @@ def run_benchmark(
 
     metrics = []
     world = get_world()
-    desc = f"Configuration {config_idx} ({batch_size=}, {micro_batch_size=}, {backend=}, {compile=})"
     iter = range(-1 if compile else 0, num_iterations)
-    iter = tqdm(iter, desc=desc) if world.is_master else iter
+    iter = tqdm(iter, desc=f"Configuration {config_idx}") if world.is_master else iter
     for sample_idx in iter:
         torch.cuda.synchronize()
         start_generate = perf_counter()
@@ -137,6 +137,7 @@ def run_benchmark(
     destroy_comm()
 
     # Clear cuda cache
+    del model
     torch.cuda.empty_cache()
 
     return metrics
@@ -165,10 +166,9 @@ def main(rank: int, args: argparse.Namespace) -> None:
         "seed": args.seed,
     }
 
-    # Generate all combinations for dynamic arguments
-    list_args = {arg: getattr(args, arg) for arg in vars(args) if isinstance(getattr(args, arg), list)}
-    dynamic_config_combinations = list(product(*list_args.values()))
-    dynamic_config_names = list(list_args.keys())
+    # Get static and dynamic arguments
+    dynamic_args = {arg: getattr(args, arg) for arg in vars(args) if isinstance(getattr(args, arg), list)}
+    static_config = {arg: getattr(args, arg) for arg in vars(args) if not isinstance(getattr(args, arg), list)}
 
     file_path = Path(f"benchmark/{args.model_name}.jsonl")
     if world.is_master and args.save:
@@ -176,11 +176,12 @@ def main(rank: int, args: argparse.Namespace) -> None:
 
     # Run benchmarks for each combination
     aggregated_results = []
-    for config_idx, config_combination in enumerate(dynamic_config_combinations, start=1):
+    for config_idx, dynamic_values in enumerate(list(product(*dynamic_args.values())), start=1):
         # Create configuration dict
-        config = dict(zip(dynamic_config_names, config_combination))
+        dynamic_config = dict(zip(dynamic_args.keys(), dynamic_values))
 
-        if config["batch_size"] < config["num_micro_batches"]:
+        # Skip if batch size is less than number of micro batches
+        if dynamic_config["batch_size"] < dynamic_config["num_micro_batches"]:
             continue
 
         # Run benchmark
@@ -188,17 +189,8 @@ def main(rank: int, args: argparse.Namespace) -> None:
             config_idx=config_idx,
             rank=rank,
             world_size=args.num_devices,
-            model_name=args.model_name,
-            dummy=args.dummy,
-            num_iterations=args.num_iterations,
-            prompt=args.prompt,
-            num_new_tokens=args.num_new_tokens,
-            device=args.device,
-            precision=args.precision,
-            seed=args.seed,
-            warmup=args.warmup,
-            log_level=args.log_level,
-            **config,
+            **static_config,
+            **dynamic_config,
         )
 
         # Ensure cache is emptied
@@ -209,7 +201,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
             return sum(values) / len(values)
 
         # Extend metrics with static and dynamic configuration
-        metrics = [{**timestamp, **static_config, **config, **metric} for metric in metrics]
+        metrics = [{**timestamp, **static_config, **dynamic_config, **metric} for metric in metrics]
 
         # Save results
         if args.save:
