@@ -79,7 +79,7 @@ def setup(
 
     # Setup communication
     num_prompt_tokens = prompt_tokens.size(-1)
-    assert batch_size > num_micro_batches, "Batch size must be larger than number of micro batches"
+    assert batch_size >= num_micro_batches, "Batch size must be at least as large as number of micro batches"
     assert batch_size % num_micro_batches == 0, f"Batch size {batch_size} must be divisible by number of micro batches {num_micro_batches}"
     micro_batch_size = batch_size // num_micro_batches 
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)

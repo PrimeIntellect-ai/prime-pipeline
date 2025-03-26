@@ -177,6 +177,9 @@ def main(rank: int, args: argparse.Namespace) -> None:
         # Create configuration dict
         config = dict(zip(dynamic_config_names, config_combination))
 
+        if config["batch_size"] < config["num_micro_batches"]:
+            continue
+
         # Run benchmark
         metrics = run_benchmark(
             config_idx=config_idx,
