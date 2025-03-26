@@ -5,6 +5,7 @@ import torch
 import torch._dynamo.config
 import torch._inductor.config
 import torch.nn as nn
+from tqdm import tqdm
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
@@ -215,6 +216,7 @@ def decode(
     decoded_tokens: Tensor,
     num_prompt_tokens: int,
     micro_batch_size: int,
+    use_tqdm: bool = False,
     **sampling_kwargs,
 ) -> Dict:
     """
@@ -265,8 +267,11 @@ def decode(
     decode_times = [[] for _ in range(len(token_idxs))]
 
     # Single-node
+    token_idx_iter = enumerate(token_idxs)
     if world.size == 1:
-        for i, token_idx in enumerate(token_idxs):
+        if use_tqdm:
+            pbar = tqdm(token_idx_iter, total=len(token_idxs), desc="Decoding")
+        for i, token_idx in token_idx_iter:
             input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
             for micro_batch_idx in range(num_micro_batches):
@@ -283,6 +288,9 @@ def decode(
                 forward_times[i].append(forward_time)
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 decode_times[i].append(perf_counter() - start_decode)
+                if use_tqdm:
+                    pbar.set_description(f"T/s: {batch_size / sum(decode_times[i]):.2f}")
+                    pbar.update()
     # Multi-node
     else:
         # Warm-up pipeline
@@ -310,7 +318,9 @@ def decode(
 
         # Interleaved decode pipeline schedule
         next_token, hidden_states = None, None
-        for i, token_idx in enumerate(token_idxs):
+        if world.is_master and use_tqdm:
+            pbar = tqdm(token_idx_iter, total=len(token_idxs))
+        for i, token_idx in token_idx_iter:
             input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
             mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
             for micro_batch_idx in range(num_micro_batches):
@@ -367,6 +377,11 @@ def decode(
                 # Schedule next recv
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
                 start_recv = perf_counter()
+            if world.is_master and use_tqdm:
+                print(batch_size, decode_times[i], sum(decode_times[i]))
+                pbar.set_description(f"T/s: {batch_size / sum(decode_times[i]):.2f}")
+                pbar.update()
+
 
     # Finish all outstanding sends
     for send_req in send_reqs:
@@ -387,6 +402,7 @@ def generate(
     prompt_tokens: Tensor,
     num_new_tokens: int,
     micro_batch_size: int,
+    use_tqdm: bool = False,
     **sampling_kwargs,
 ) -> Tuple[Tensor, Dict, Dict]:
     """
@@ -430,6 +446,7 @@ def generate(
         decoded_tokens=decoded_tokens,
         micro_batch_size=micro_batch_size,
         num_prompt_tokens=num_prompt_tokens,
+        use_tqdm=use_tqdm,
         **sampling_kwargs,
     )
 

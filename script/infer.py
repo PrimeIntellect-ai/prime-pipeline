@@ -48,6 +48,7 @@ def main(args: argparse.Namespace) -> None:
             micro_batch_size=micro_batch_size,
             temperature=args.temperature,
             top_k=args.top_k,
+            use_tqdm=True
         )
         if sample_idx == -1:
             logger.info(f"Compiled in {time.perf_counter() - start_time:.2f} seconds")

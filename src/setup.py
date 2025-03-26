@@ -53,6 +53,7 @@ def setup(
 
     # Load model
     t0 = perf_counter()
+    logger.info(f"Loading model {model_name}...")
     if world.size == 1:
         model = get_model(model_name=model_name, device=device, precision=precision, dummy=dummy)
         logger.info(f"Loaded model in {perf_counter() - t0:.02f} seconds")
