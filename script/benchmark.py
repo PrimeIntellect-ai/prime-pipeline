@@ -146,6 +146,9 @@ def main(rank: int, args: argparse.Namespace) -> None:
     # Setup world
     world = setup_world(rank=rank, size=args.num_devices)
 
+    # Set OMP_NUM_THREADS
+    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // world.size)
+
     # Prepare static configuration to identify benchmark run
     timestamp = {
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()[:7],
