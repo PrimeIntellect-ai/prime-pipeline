@@ -136,6 +136,8 @@ class TorchP2PComm(P2PCommBase):
         self.bwd_prefill_shape = bwd_shape
         self.fwd_dtype, self.bwd_dtype = fwd_dtype, bwd_dtype
         self.num_prompt_tokens = num_prompt_tokens
+        if self.world.size <= 1:
+            return
         self._setup()
 
     def _setup(self):
