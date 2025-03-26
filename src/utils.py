@@ -24,7 +24,8 @@ def seed_everything(seed: int) -> None:
 
 def get_device(device: str, world: World) -> torch.device:
     if device == "cuda":
-        return torch.device(f"cuda:{world.rank % torch.cuda.device_count()}")
+        local_rank = os.getenv("LOCAL_RANK", world.rank % torch.cuda.device_count())
+        return torch.device(f"cuda:{local_rank}")
     elif device == "cpu":
         return torch.device("cpu")
     else:

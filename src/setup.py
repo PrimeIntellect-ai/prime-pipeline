@@ -9,6 +9,7 @@ from .model import get_model, get_model_shard
 from .serializer import get_serializer
 from .utils import get_device, get_precision, get_tokenizer, seed_everything
 from .world import setup_world
+from .generate import compile_model, generate
 
 def setup(
     rank: int,
@@ -22,7 +23,10 @@ def setup(
     prompt: str,
     backend: str,
     num_micro_batches: int,
+    num_new_tokens: int,
+    num_cache_tokens: int,
     batch_size: int,
+    compile: bool,
     latency: Optional[int] = None,  # Only set for benchmark
 ) -> Tuple:
     """
@@ -41,12 +45,12 @@ def setup(
     seed_everything(seed)
 
     # Setup device
-    logger.info(f"Using device {device}")
     device = get_device(device=device, world=world)
+    logger.info(f"Using device {device}")
 
     # Setup precision
-    logger.info(f"Using precision {precision}")
     precision = get_precision(precision=precision)
+    logger.info(f"Using precision {precision}")
 
     # Load model
     t0 = perf_counter()
@@ -64,12 +68,32 @@ def setup(
 
     # Encode prompt (batch_size, num_prompt_tokens)
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(device).repeat(batch_size, 1)
-
-    # Setup communication
     num_prompt_tokens = prompt_tokens.size(-1)
+
+    # Setup model cache
     assert batch_size >= num_micro_batches, "Batch size must be at least as large as number of micro batches"
     assert batch_size % num_micro_batches == 0, f"Batch size {batch_size} must be divisible by number of micro batches {num_micro_batches}"
     micro_batch_size = batch_size // num_micro_batches 
+    num_total_tokens = num_prompt_tokens + num_new_tokens
+    assert num_total_tokens <= model.config.block_size, f"Total tokens {num_total_tokens} must be less than or equal to model block size {model.config.block_size}"
+    if num_cache_tokens == 0:
+        num_cache_tokens = num_total_tokens
+    assert num_cache_tokens >= num_total_tokens, f"Number of cache tokens {num_cache_tokens} must be greater than or equal to total tokens {num_total_tokens}"
+    logger.info(f"Setting up KV cache for {num_cache_tokens} tokens...")
+    t0 = perf_counter()
+    with torch.device(device):
+        model.setup_caches(
+            num_micro_batches=num_micro_batches,
+            max_micro_batch_size=micro_batch_size,
+            max_seq_length=num_cache_tokens,
+        )
+    logger.info(f"Set up KV cache in {perf_counter() - t0:.02f} seconds")
+
+    # Allocate tensor for decoded tokens
+    decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
+    decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
+
+    # Setup communication
     hidden_states_shape = (micro_batch_size, 1, model.config.dim)
     tokens_shape = (micro_batch_size, 1)
     hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
@@ -95,4 +119,20 @@ def setup(
         raise ValueError(f"Invalid backend: {backend}")
     setup_comm(backend, **kwargs)
 
-    return model, tokenizer, prompt_tokens, micro_batch_size
+    # Compile model
+    if compile:
+        torch.cuda.synchronize()
+        start_time = perf_counter()
+        logger.info("Compiling model...")
+        compile_model()
+        generate(
+            model=model,
+            decoded_tokens=decoded_tokens[:, :num_prompt_tokens+2], # Ensures running prefill and decode
+            num_prompt_tokens=num_prompt_tokens,
+            micro_batch_size=micro_batch_size,
+            use_tqdm=False,
+        )
+        logger.info(f"Compiled model in {perf_counter() - start_time:.2f} seconds")
+
+
+    return model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size

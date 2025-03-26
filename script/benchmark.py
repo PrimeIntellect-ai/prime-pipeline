@@ -50,7 +50,6 @@ def compute_metrics(metrics: Dict, warmup: bool, stage: Literal["prefill", "deco
 
 
 def run_benchmark(
-    config_idx: int,
     rank: int,
     world_size: int,
     model_name: str,
@@ -58,6 +57,7 @@ def run_benchmark(
     num_iterations: int,
     prompt: str,
     num_new_tokens: int,
+    num_cache_tokens: int,
     batch_size: int,
     num_micro_batches: int,
     device: str,
@@ -80,7 +80,7 @@ def run_benchmark(
 
     # Setup world, logger, comm and load model
     start_setup = perf_counter()
-    model, _, prompt_tokens, micro_batch_size = setup(
+    model, _, decoded_tokens, num_prompt_tokens, micro_batch_size = setup(
         rank=rank,
         world_size=world_size,
         log_level=log_level,
@@ -92,26 +92,25 @@ def run_benchmark(
         prompt=prompt,
         backend=backend,
         num_micro_batches=num_micro_batches,
+        num_new_tokens=num_new_tokens,
+        num_cache_tokens=num_cache_tokens,
         batch_size=batch_size,
+        compile=compile,
         latency=latency,
     )
     setup_time = {"setup_time": perf_counter() - start_setup, "compile_time": 0}
 
     metrics = []
-    world = get_world()
-    iter = range(-1 if compile else 0, num_iterations)
-    for sample_idx in iter:
-        if sample_idx == -1 and world.is_master:
-            get_logger().info("Compiling model...")
+    for sample_idx in range(num_iterations):
         torch.cuda.synchronize()
         start_generate = perf_counter()
         _, prefill_metrics, decode_metrics = generate(
             model=model,
-            prompt_tokens=prompt_tokens,
-            num_new_tokens=num_new_tokens,
+            decoded_tokens=decoded_tokens,
+            num_prompt_tokens=num_prompt_tokens,
             micro_batch_size=micro_batch_size,
             compile=compile,
-            use_tqdm=False if sample_idx == -1 else True,
+            use_tqdm=True,
         )
         if sample_idx == -1:
             setup_time["compile_time"] = perf_counter() - start_generate
@@ -189,7 +188,6 @@ def main(rank: int, args: argparse.Namespace) -> None:
 
         # Run benchmark
         metrics = run_benchmark(
-            config_idx=config_idx,
             rank=rank,
             world_size=args.num_devices,
             **static_config,
@@ -236,6 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-iterations", type=int, default=3, help="Number of samples to generate.")
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Prompt to generate from.")
     parser.add_argument("--num-new-tokens", type=int, default=10, help="Number of tokens to generate.")
+    parser.add_argument("--num-cache-tokens", type=int, default=0, help="Number of cache tokens.")
     parser.add_argument("--precision", type=str, default="bfloat16", help="Precision to use for the model.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use for the model.")
     parser.add_argument("--seed", type=int, default=1234, help="Seed for reproducibility.")

@@ -395,15 +395,24 @@ def decode(
         "num_new_tokens": batch_size * len(token_idxs),
     }
 
+def compile_model():
+    """Compile the model"""
+    global create_block_mask
+    create_block_mask = torch.compile(create_block_mask, fullgraph=True)
+
+    global adjust_mask
+    adjust_mask = torch.compile(adjust_mask, fullgraph=True)
+
+    global model_forward
+    model_forward = torch.compile(model_forward, fullgraph=True)
 
 @torch.no_grad()
 def generate(
     model: nn.Module,
-    prompt_tokens: Tensor,
-    num_new_tokens: int,
+    decoded_tokens: Tensor,
+    num_prompt_tokens: int,
     micro_batch_size: int,
     use_tqdm: bool = False,
-    compile: bool = False,
     **sampling_kwargs,
 ) -> Tuple[Tensor, Dict, Dict]:
     """
@@ -416,32 +425,6 @@ def generate(
         micro_batch_size: int
         **sampling_kwargs: Dict of kwargs for the sample function
     """
-    # Setup model cache
-    batch_size, num_prompt_tokens = prompt_tokens.shape
-    num_micro_batches = batch_size // micro_batch_size
-    num_total_tokens = min(num_prompt_tokens + num_new_tokens, model.config.block_size)
-    device = model.layers[0].feed_forward.w1.weight.device
-    with torch.device(device):
-        model.setup_caches(
-            num_micro_batches=num_micro_batches,
-            max_micro_batch_size=micro_batch_size,
-            max_seq_length=num_total_tokens,
-        )
-
-    # Compile model
-    if compile:
-        global create_block_mask
-        create_block_mask = torch.compile(create_block_mask, fullgraph=True)
-
-        global adjust_mask
-        adjust_mask = torch.compile(adjust_mask, fullgraph=True)
-
-        global model_forward
-        model_forward = torch.compile(model_forward, fullgraph=True)
-
-    # Allocate tensor for decoded tokens
-    decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
-    decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
 
     # Prefill prompt tokens in-place
     prefill_metrics = prefill(

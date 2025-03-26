@@ -1,9 +1,7 @@
 import argparse
 import os
-import time
 
 import autorootcwd  # noqa: F401
-import torch
 from lovely_tensors import monkey_patch
 
 from src.comm import get_comm
@@ -18,7 +16,7 @@ monkey_patch()
 
 def main(args: argparse.Namespace) -> None:
     # Setup
-    model, tokenizer, prompt_tokens, micro_batch_size = setup(
+    model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size = setup(
         rank=int(os.environ.get("RANK", 0)),
         world_size=int(os.environ.get("WORLD_SIZE", 1)),
         log_level=args.log_level,
@@ -30,36 +28,30 @@ def main(args: argparse.Namespace) -> None:
         prompt=args.prompt,
         backend=args.backend,
         num_micro_batches=args.num_micro_batches,
+        num_new_tokens=args.num_new_tokens,
+        num_cache_tokens=args.num_cache_tokens,
         batch_size=args.batch_size,
+        compile=args.compile,
     )
 
     # Get world, logger and comm
     world, logger, comm = get_world(), get_logger(), get_comm()
 
     # Generate
-    for sample_idx in range(-1 if args.compile else 0, 1):
-        if sample_idx == -1:
-            logger.info("Compiling model...")
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
-        decoded_tokens, _, _ = generate(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            num_new_tokens=args.num_new_tokens,
-            micro_batch_size=micro_batch_size,
-            compile=args.compile,
-            use_tqdm=args.use_tqdm if sample_idx != -1 else False,
-            temperature=args.temperature,
-            top_k=args.top_k,
-        )
-        if sample_idx == -1:
-            logger.info(f"Compiled model in {time.perf_counter() - start_time:.2f} seconds")
-            continue
+    decoded_tokens, _, _ = generate(
+        model=model,
+        decoded_tokens=decoded_tokens,
+        num_prompt_tokens=num_prompt_tokens,
+        micro_batch_size=micro_batch_size,
+        use_tqdm=args.use_tqdm,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
 
-        logger.debug(f"Decoded tokens: {decoded_tokens.tolist()}")
-        if world.is_master:
-            for batch_idx, generation in enumerate(decoded_tokens):
-                logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist(), skip_special_tokens=True)}")
+    logger.debug(f"Decoded tokens: {decoded_tokens.tolist()}")
+    if world.is_master:
+        for batch_idx, generation in enumerate(decoded_tokens):
+            logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist(), skip_special_tokens=True)}")
 
     # Destroy communication
     comm.destroy()
@@ -83,6 +75,7 @@ if __name__ == "__main__":
         default=1,
         help="Number of micro-batches.",
     )
+    parser.add_argument("--num-cache-tokens", type=int, default=0, help="Number of cache tokens.")
     parser.add_argument(
         "--num-new-tokens",
         type=int,
@@ -112,6 +105,8 @@ if __name__ == "__main__":
         default="torch",
         help="Either `torch` or `iroh`.",
     )
-    parser.add_argument("--use-tqdm", action="store_true", help="Use tqdm for progress bar.")
     parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
-    main(parser.parse_args())
+    parser.add_argument("--use-tqdm", action="store_true", help="Use tqdm for progress bar.")
+    args = parser.parse_args()
+
+    main(args)
