@@ -1,7 +1,7 @@
 import os
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union, Tuple, Any, Dict
 
 import torch
 import torch.nn as nn
@@ -105,6 +105,75 @@ class ModelArgs:
         if name in MODEL_REGISTRY:
             return cls(**MODEL_REGISTRY[name.lower()])
         raise ValueError(f"Model {name} is not yet supported.")
+
+def is_power_of_two(n: int) -> bool:
+    return (n & (n - 1)) == 0
+
+def next_power_of_two(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+# from: https://github.com/pytorch/pytorch/issues/143117
+# compilation args taken from https://github.com/pytorch/pytorch/issues/142817
+def modded_flex_attention(
+    query: Tensor,  # (B, Hq, L, E)
+    key: Tensor,    # (B, Hkv, S, E)
+    value: Tensor,  # (B, Hkv, S, E)
+    score_mod = None,
+    block_mask: Optional[BlockMask] = None,
+    scale: Optional[float] = None,
+    enable_gqa: bool = False,
+    return_lse: bool = False,
+    kernel_options: Optional[Dict[str, Any]] = None,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    batch_size, n_q_heads, q_len, head_dims = query.shape
+    _, n_kv_heads, kv_len, _ = key.shape
+
+    min_len = min(q_len, kv_len)
+    group_size = n_q_heads // n_kv_heads
+
+    if enable_gqa and min_len < 128 and not is_power_of_two(group_size):
+        new_group_size = next_power_of_two(group_size)
+        extra_heads_per_group = new_group_size - group_size
+
+        n_groups = n_q_heads // group_size
+
+        new_n_q_heads = n_q_heads + n_groups * extra_heads_per_group
+
+        # for each group, append extra_heads_per_group of fake heads
+        query = torch.concat([
+            query.view(batch_size, n_groups, group_size, q_len, head_dims),
+            query.new_zeros(batch_size, n_groups, extra_heads_per_group, q_len, head_dims),
+        ], dim=2).view(batch_size, new_n_q_heads, q_len, head_dims).contiguous()
+
+        result = flex_attention(
+            query, key, value,
+            score_mod=score_mod,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            return_lse=return_lse,
+            kernel_options=kernel_options,
+        )
+
+        attn_out = result if not return_lse else result[0]
+
+        attn_out = attn_out.view(batch_size, n_groups, new_group_size, q_len, head_dims)
+        attn_out = attn_out[:, :, :-extra_heads_per_group, :, :]
+        attn_out = attn_out.reshape(batch_size, n_q_heads, q_len, head_dims)
+
+        return attn_out if not return_lse else (attn_out, result[1])
+
+    # If no padding is needed, just run flex_attention directly
+    return flex_attention(
+        query, key, value,
+        score_mod=score_mod,
+        block_mask=block_mask,
+        scale=scale,
+        enable_gqa=enable_gqa,
+        return_lse=return_lse,
+        kernel_options=kernel_options,
+    )
 
 
 class KVCache(nn.Module):
@@ -333,7 +402,7 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(micro_batch_idx, input_pos, k, v)
 
-        y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        y = modded_flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 

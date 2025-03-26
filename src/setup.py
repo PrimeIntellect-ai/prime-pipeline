@@ -9,8 +9,6 @@ from .model import get_model, get_model_shard
 from .serializer import get_serializer
 from .utils import get_device, get_precision, get_tokenizer, seed_everything
 from .world import setup_world
-from .generate import create_block_mask, adjust_mask, model_forward
-
 
 def setup(
     rank: int,
@@ -22,7 +20,6 @@ def setup(
     model_name: str,
     dummy: bool,
     prompt: str,
-    compile: bool,
     backend: str,
     num_micro_batches: int,
     batch_size: int,
@@ -60,17 +57,6 @@ def setup(
     else:
         model = get_model_shard(model_name=model_name, rank=rank, world_size=world_size, device=device, precision=precision, dummy=dummy)
         logger.info(f"Loaded model shard in {perf_counter() - t0:.02f} seconds")
-
-    # Compile model
-    if compile:
-        global create_block_mask
-        create_block_mask = torch.compile(create_block_mask, fullgraph=True)
-
-        global adjust_mask
-        adjust_mask = torch.compile(adjust_mask, fullgraph=True)
-
-        global model_forward
-        model_forward = torch.compile(model_forward, fullgraph=True)
 
     # Load tokenizer
     logger.info(f"Loading tokenizer for {model_name}")

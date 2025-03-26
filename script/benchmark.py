@@ -90,7 +90,6 @@ def run_benchmark(
         model_name=model_name,
         dummy=dummy,
         prompt=prompt,
-        compile=compile,
         backend=backend,
         num_micro_batches=num_micro_batches,
         batch_size=batch_size,
@@ -101,8 +100,9 @@ def run_benchmark(
     metrics = []
     world = get_world()
     iter = range(-1 if compile else 0, num_iterations)
-    iter = tqdm(iter, desc=f"Configuration {config_idx}") if world.is_master else iter
     for sample_idx in iter:
+        if sample_idx == -1 and world.is_master:
+            get_logger().info("Compiling model...")
         torch.cuda.synchronize()
         start_generate = perf_counter()
         _, prefill_metrics, decode_metrics = generate(
@@ -110,10 +110,12 @@ def run_benchmark(
             prompt_tokens=prompt_tokens,
             num_new_tokens=num_new_tokens,
             micro_batch_size=micro_batch_size,
+            compile=compile,
+            use_tqdm=False if sample_idx == -1 else True,
         )
         if sample_idx == -1:
             setup_time["compile_time"] = perf_counter() - start_generate
-            get_logger().info(f"Compiled in {setup_time['compile_time']:.2f} seconds")
+            get_logger().info(f"Compiled model in {setup_time['compile_time']:.2f} seconds")
             continue
 
         # Compute metrics
@@ -169,7 +171,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
     # Get static and dynamic arguments
     dynamic_args = {arg: getattr(args, arg) for arg in vars(args) if isinstance(getattr(args, arg), list)}
     static_config = {arg: getattr(args, arg) for arg in vars(args) if not isinstance(getattr(args, arg), list)}
-
+    
     file_path = Path(f"benchmark/{args.model_name}.jsonl")
     if world.is_master and args.save:
         os.makedirs(file_path.parent, exist_ok=True)
@@ -179,6 +181,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
     for config_idx, dynamic_values in enumerate(list(product(*dynamic_args.values())), start=1):
         # Create configuration dict
         dynamic_config = dict(zip(dynamic_args.keys(), dynamic_values))
+        print(f"Running configuration {config_idx} with {dynamic_config}")
 
         # Skip if batch size is less than number of micro batches
         if dynamic_config["batch_size"] < dynamic_config["num_micro_batches"]:
@@ -227,7 +230,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # Constant arguments
+    # Static arguments
     parser.add_argument("--model-name", type=str, default="meta-llama/llama-2-7b-chat-hf", help="HF model name.")
     parser.add_argument("--num-devices", type=int, default=1, help="Number of pipeline stages.")
     parser.add_argument("--num-iterations", type=int, default=3, help="Number of samples to generate.")
@@ -241,7 +244,7 @@ if __name__ == "__main__":
     parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
     parser.add_argument("--save", action="store_true", help="Save results to CSV.")
 
-    # Combination arguments
+    # Dynamic arguments
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1], help="Batch size.")
     parser.add_argument(
         "--num-micro-batches",
@@ -259,9 +262,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--compile",
-        type=bool,
+        type=str,
         nargs="+",
-        default=[False],
+        default=["False"],
         help="Whether to compile the model.",
     )
     parser.add_argument(
@@ -269,6 +272,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Convert compile to bool
+    args.compile = [True if compile == "True" else False for compile in args.compile]
 
     ps = [
         Process(

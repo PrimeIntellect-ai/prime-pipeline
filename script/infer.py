@@ -28,7 +28,6 @@ def main(args: argparse.Namespace) -> None:
         model_name=args.model_name,
         dummy=args.dummy,
         prompt=args.prompt,
-        compile=args.compile,
         backend=args.backend,
         num_micro_batches=args.num_micro_batches,
         batch_size=args.batch_size,
@@ -39,6 +38,8 @@ def main(args: argparse.Namespace) -> None:
 
     # Generate
     for sample_idx in range(-1 if args.compile else 0, 1):
+        if sample_idx == -1:
+            logger.info("Compiling model...")
         torch.cuda.synchronize()
         start_time = time.perf_counter()
         decoded_tokens, _, _ = generate(
@@ -46,12 +47,13 @@ def main(args: argparse.Namespace) -> None:
             prompt_tokens=prompt_tokens,
             num_new_tokens=args.num_new_tokens,
             micro_batch_size=micro_batch_size,
+            compile=args.compile,
+            use_tqdm=args.use_tqdm if sample_idx != -1 else False,
             temperature=args.temperature,
             top_k=args.top_k,
-            use_tqdm=True
         )
         if sample_idx == -1:
-            logger.info(f"Compiled in {time.perf_counter() - start_time:.2f} seconds")
+            logger.info(f"Compiled model in {time.perf_counter() - start_time:.2f} seconds")
             continue
 
         logger.debug(f"Decoded tokens: {decoded_tokens.tolist()}")
@@ -110,5 +112,6 @@ if __name__ == "__main__":
         default="torch",
         help="Either `torch` or `iroh`.",
     )
+    parser.add_argument("--use-tqdm", action="store_true", help="Use tqdm for progress bar.")
     parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
     main(parser.parse_args())

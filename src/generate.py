@@ -12,6 +12,7 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from .comm import get_comm
 from .logger import get_logger
 from .world import get_world
+from .utils import flatten_list
 
 # Setup compile flags
 torch._inductor.config.coordinate_descent_tuning = True
@@ -289,7 +290,7 @@ def decode(
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 decode_times[i].append(perf_counter() - start_decode)
                 if use_tqdm:
-                    pbar.set_description(f"T/s: {batch_size / sum(decode_times[i]):.2f}")
+                    pbar.set_description(f"T/s: {(i+1) * batch_size / sum(flatten_list(decode_times)):.2f}")
                     pbar.update()
     # Multi-node
     else:
@@ -378,8 +379,7 @@ def decode(
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
                 start_recv = perf_counter()
             if world.is_master and use_tqdm:
-                print(batch_size, decode_times[i], sum(decode_times[i]))
-                pbar.set_description(f"T/s: {batch_size / sum(decode_times[i]):.2f}")
+                pbar.set_description(f"T/s: {(i+1) * batch_size / sum(flatten_list(decode_times)):.2f}")
                 pbar.update()
 
 
@@ -403,6 +403,7 @@ def generate(
     num_new_tokens: int,
     micro_batch_size: int,
     use_tqdm: bool = False,
+    compile: bool = False,
     **sampling_kwargs,
 ) -> Tuple[Tensor, Dict, Dict]:
     """
@@ -426,6 +427,17 @@ def generate(
             max_micro_batch_size=micro_batch_size,
             max_seq_length=num_total_tokens,
         )
+
+    # Compile model
+    if compile:
+        global create_block_mask
+        create_block_mask = torch.compile(create_block_mask, fullgraph=True)
+
+        global adjust_mask
+        adjust_mask = torch.compile(adjust_mask, fullgraph=True)
+
+        global model_forward
+        model_forward = torch.compile(model_forward, fullgraph=True)
 
     # Allocate tensor for decoded tokens
     decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
