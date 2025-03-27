@@ -274,7 +274,13 @@ def decode(
                 end_idx = start_idx + micro_batch_size
                 cur_tokens = decoded_tokens[start_idx:end_idx, token_idx - 1].unsqueeze(-1)
                 start_forward = perf_counter()
-                logits = model_forward(model, micro_batch_idx, mask, cur_tokens, input_pos)
+                logits = model_forward(
+                    model,
+                    micro_batch_idx,
+                    mask,
+                    cur_tokens,
+                    input_pos,
+                )
                 next_token = sample(logits, **sampling_kwargs)
                 forward_time = perf_counter() - start_forward
                 logger.debug(f"Forward for {token_idx=} {micro_batch_idx=} took {forward_time * 1000:.2f}ms")
@@ -397,7 +403,7 @@ def compile_model():
     adjust_mask = torch.compile(adjust_mask, fullgraph=True)
 
     global model_forward
-    model_forward = torch.compile(model_forward, fullgraph=True)
+    model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
 @torch.no_grad()
 def generate(

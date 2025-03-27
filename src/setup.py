@@ -127,18 +127,7 @@ def setup(
 
     # Compile model
     if compile:
-        torch.cuda.synchronize()
-        start_time = perf_counter()
         logger.info("Compiling model...")
         compile_model()
-        warmup_tokens = decoded_tokens[:, :num_prompt_tokens+3].clone()
-        generate(
-            model=model,
-            decoded_tokens=warmup_tokens,
-            num_prompt_tokens=num_prompt_tokens,
-            micro_batch_size=micro_batch_size,
-            use_tqdm=False,
-        )
-        logger.info(f"Compiled model in {perf_counter() - start_time:.2f} seconds")
 
     return model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size

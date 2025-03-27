@@ -59,6 +59,10 @@ def flatten_list(list_of_lists: List[List[Any]]) -> List[Any]:
     """Flatten a list of lists into a single list."""
     return [item for sublist in list_of_lists for item in sublist]
 
+def discard_initial_tokens(decoded_tokens: List, num_discard_tokens: int) -> List:
+    """Discard the initial tokens from the decoded tokens."""
+    return decoded_tokens[num_discard_tokens:]
+
 
 def convert_model(model_name: str) -> None:
     config = ModelArgs.from_name(model_name)
