@@ -14,6 +14,7 @@ from .generate import compile_model, generate
 
 def setup(
     rank: int,
+    local_rank: int,
     world_size: int,
     log_level: str,
     seed: int,
@@ -35,7 +36,7 @@ def setup(
     prompt and compiles model if requested.
     """
     # Setup world
-    world = setup_world(rank, world_size)
+    world = setup_world(rank, local_rank, world_size)
 
     # Set OMP_NUM_THREADS
     os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // world_size)
@@ -121,6 +122,7 @@ def setup(
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
+    logger.info(f"Setting up communication backend {backend}...")
     setup_comm(backend, **kwargs)
 
     # Compile model
@@ -129,14 +131,14 @@ def setup(
         start_time = perf_counter()
         logger.info("Compiling model...")
         compile_model()
+        warmup_tokens = decoded_tokens[:, :num_prompt_tokens+3].clone()
         generate(
             model=model,
-            decoded_tokens=decoded_tokens[:, :num_prompt_tokens+2], # Ensures running prefill and decode
+            decoded_tokens=warmup_tokens,
             num_prompt_tokens=num_prompt_tokens,
             micro_batch_size=micro_batch_size,
             use_tqdm=False,
         )
         logger.info(f"Compiled model in {perf_counter() - start_time:.2f} seconds")
-
 
     return model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size
