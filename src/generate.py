@@ -166,14 +166,7 @@ def prefill(
 
         # Forward pass
         start_forward = perf_counter()
-        outputs = model_forward(
-            model,
-            micro_batch_idx,
-            block_mask,
-            prompt_tokens,
-            input_pos,
-            hidden_states,
-        )
+        outputs = model(micro_batch_idx, block_mask, input_pos, prompt_tokens, hidden_states)
 
         # Sample next token
         if world.is_last_stage:
