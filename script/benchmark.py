@@ -4,7 +4,7 @@ import os
 import subprocess
 from datetime import datetime
 from itertools import product
-from multiprocessing import Process
+from multiprocessing import Process, Queue, set_start_method
 from pathlib import Path
 from time import perf_counter
 from typing import Dict, List, Literal
@@ -13,14 +13,11 @@ import autorootcwd  # noqa: F401
 import torch
 from lovely_tensors import monkey_patch
 from tabulate import tabulate
-from tqdm import tqdm
 
-from src.comm import destroy_comm
 from src.generate import generate
 from src.logger import get_logger
 from src.setup import setup
 from src.utils import flatten_list, mean
-from src.world import setup_world, get_world
 
 # Use lovely tensors
 monkey_patch()
@@ -51,6 +48,8 @@ def compute_metrics(metrics: Dict, warmup: bool, stage: Literal["prefill", "deco
 
 def run_benchmark(
     rank: int,
+    queue: Queue,
+    local_rank: int,
     world_size: int,
     model_name: str,
     dummy: bool,
@@ -69,14 +68,18 @@ def run_benchmark(
     seed: int,
     log_level: str,
     **kwargs
-) -> Dict:
+) -> None:
     # Populate environment variables for multi-node setup
     assert rank in IROH_PAIRS, f"Node {rank} is not in the list of known nodes: {IROH_PAIRS.keys()}"
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["CACHE_DIR"] = "/workspace"
     if backend == "iroh":
         os.environ["IROH_SEED"] = str(rank)
         os.environ["IROH_PEER_ID"] = IROH_PAIRS[(rank + 1) % world_size]
+
+    # Set OMP_NUM_THREADS
+    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // world_size)
 
     # Setup world, logger, comm and load model
     start_setup = perf_counter()
@@ -103,19 +106,13 @@ def run_benchmark(
     metrics = []
     for sample_idx in range(num_iterations):
         torch.cuda.synchronize()
-        start_generate = perf_counter()
         _, prefill_metrics, decode_metrics = generate(
             model=model,
             decoded_tokens=decoded_tokens,
             num_prompt_tokens=num_prompt_tokens,
             micro_batch_size=micro_batch_size,
-            compile=compile,
             use_tqdm=True,
         )
-        if sample_idx == -1:
-            setup_time["compile_time"] = perf_counter() - start_generate
-            get_logger().info(f"Compiled model in {setup_time['compile_time']:.2f} seconds")
-            continue
 
         # Compute metrics
         computed_prefill_metrics = compute_metrics(prefill_metrics, warmup=False, stage="prefill")
@@ -134,23 +131,10 @@ def run_benchmark(
             }
         )
 
-    # Destroy communication (necessary for iroh backend, because it adjusts streams to number of micro batches)
-    destroy_comm()
+    # Send metrics to main process
+    queue.put((rank, metrics))
 
-    # Clear cuda cache
-    del model
-    torch.cuda.empty_cache()
-
-    return metrics
-
-
-def main(rank: int, args: argparse.Namespace) -> None:
-    # Setup world
-    world = setup_world(rank=rank, size=args.num_devices)
-
-    # Set OMP_NUM_THREADS
-    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // world.size)
-
+def main(args: argparse.Namespace) -> None:
     # Prepare static configuration to identify benchmark run
     timestamp = {
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()[:7],
@@ -159,7 +143,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
     }
     static_config = {
         "model_name": args.model_name,
-        "num_devices": args.num_devices,
+        "world_size": args.world_size,
         "prompt": args.prompt,
         "num_new_tokens": args.num_new_tokens,
         "precision": args.precision,
@@ -172,7 +156,7 @@ def main(rank: int, args: argparse.Namespace) -> None:
     static_config = {arg: getattr(args, arg) for arg in vars(args) if not isinstance(getattr(args, arg), list)}
     
     file_path = Path(f"benchmark/{args.model_name}.jsonl")
-    if world.is_master and args.save:
+    if args.save:
         os.makedirs(file_path.parent, exist_ok=True)
 
     # Run benchmarks for each combination
@@ -187,50 +171,59 @@ def main(rank: int, args: argparse.Namespace) -> None:
             continue
 
         # Run benchmark
-        metrics = run_benchmark(
-            rank=rank,
-            world_size=args.num_devices,
-            **static_config,
-            **dynamic_config,
-        )
+        try:
+            queue = Queue()
+            ps = [Process(target=run_benchmark, args=(rank, queue), kwargs={**static_config, **dynamic_config}) for rank in range(args.world_size)]
+            for p in ps:
+                p.start()
+            for p in ps:
+                p.join()
+        except Exception as e:
+            print(f"Error: {e}")
+            for p in ps:
+                p.terminate()
+            raise e
 
-        # Ensure cache is emptied
-        torch.cuda.empty_cache()
+        # Get results
+        all_metrics = {}
+        while not queue.empty():
+            rank, metrics = queue.get()
+            all_metrics[rank] = metrics
 
         # Aggregate metrics
-        def mean(values: List[float]) -> float:
-            return sum(values) / len(values)
+        for rank, metrics in all_metrics.items():
 
-        # Extend metrics with static and dynamic configuration
-        metrics = [{**timestamp, **static_config, **dynamic_config, **metric} for metric in metrics]
+            # Extend metrics with static and dynamic configuration
+            metrics = [{**timestamp, **static_config, **dynamic_config, **metric} for metric in metrics]
 
-        # Save results
-        if args.save:
-            with open(file_path, "a") as f:
-                for metric in metrics:
-                    f.write(json.dumps(metric) + "\n")
+            # Save results
+            if args.save:
+                with open(file_path, "a") as f:
+                    for metric in metrics:
+                        f.write(json.dumps(metric) + "\n")
 
         # Aggregate most relevant metrics
         metrics_to_aggregate = ["setup_time", "compile_time", "prefill_time", "decode_time", "prefill_tps", "decode_tps"]
-        aggregated_metrics = {key: mean([result[key] for result in metrics]) for key in metrics_to_aggregate}
+        aggregated_metrics = {key: mean([result[key] for result in all_metrics[0]]) for key in metrics_to_aggregate}
         aggregated_results.append(aggregated_metrics)
 
 
     # Display aggregated results
-    if world.is_master:
-        headers = ["config_idx"] + list(aggregated_results[0].keys())
-        table = [[config_idx] + list(result.values()) for config_idx, result in enumerate(aggregated_results, start=1)]
-        print(tabulate(table, headers=headers))
+    headers = ["config_idx"] + list(aggregated_results[0].keys())
+    table = [[config_idx] + list(result.values()) for config_idx, result in enumerate(aggregated_results, start=1)]
+    print(tabulate(table, headers=headers))
 
-        print("\nAll benchmarks completed!")
+    print("\nAll benchmarks completed!")
 
 
 if __name__ == "__main__":
+    set_start_method('spawn')
     parser = argparse.ArgumentParser()
 
     # Static arguments
     parser.add_argument("--model-name", type=str, default="meta-llama/llama-2-7b-chat-hf", help="HF model name.")
-    parser.add_argument("--num-devices", type=int, default=1, help="Number of pipeline stages.")
+    parser.add_argument("--local-rank", type=int, default=0, help="Sets local rank in CUDA process.")
+    parser.add_argument("--world-size", type=int, default=1, help="Number of pipeline stages.")
     parser.add_argument("--num-iterations", type=int, default=3, help="Number of samples to generate.")
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Prompt to generate from.")
     parser.add_argument("--num-new-tokens", type=int, default=10, help="Number of tokens to generate.")
@@ -275,18 +268,5 @@ if __name__ == "__main__":
     # Convert compile to bool
     args.compile = [True if compile == "True" else False for compile in args.compile]
 
-    ps = [
-        Process(
-            target=main,
-            args=(
-                rank,
-                args,
-            ),
-        )
-        for rank in range(args.num_devices)
-    ]
+    main(args)
 
-    for p in ps:
-        p.start()
-    for p in ps:
-        p.join()
