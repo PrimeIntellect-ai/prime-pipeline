@@ -4,10 +4,10 @@ import os
 import subprocess
 from datetime import datetime
 from itertools import product
-from multiprocessing import Process, Queue, set_start_method
+from multiprocessing import Process, Queue
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Literal
+from typing import Dict, Literal
 
 import autorootcwd  # noqa: F401
 import torch
@@ -78,9 +78,6 @@ def run_benchmark(
         os.environ["IROH_SEED"] = str(rank)
         os.environ["IROH_PEER_ID"] = IROH_PAIRS[(rank + 1) % world_size]
 
-    # Set OMP_NUM_THREADS
-    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // world_size)
-
     # Setup world, logger, comm and load model
     start_setup = perf_counter()
     model, _, decoded_tokens, num_prompt_tokens, micro_batch_size = setup(
@@ -132,14 +129,13 @@ def run_benchmark(
         )
 
     # Send metrics to main process
-    queue.put((rank, metrics))
+    queue.put((rank, torch.cuda.get_device_name(), metrics))
 
 def main(args: argparse.Namespace) -> None:
     # Prepare static configuration to identify benchmark run
     timestamp = {
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()[:7],
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "gpu": torch.cuda.get_device_name(),
     }
     static_config = {
         "model_name": args.model_name,
@@ -168,6 +164,7 @@ def main(args: argparse.Namespace) -> None:
 
         # Skip if batch size is less than number of micro batches
         if dynamic_config["batch_size"] < dynamic_config["num_micro_batches"]:
+            print("Skipping because batch size is less than number of micro batches")
             continue
 
         # Run benchmark
@@ -187,14 +184,14 @@ def main(args: argparse.Namespace) -> None:
         # Get results
         all_metrics = {}
         while not queue.empty():
-            rank, metrics = queue.get()
+            rank, gpu, metrics = queue.get()
             all_metrics[rank] = metrics
 
         # Aggregate metrics
         for rank, metrics in all_metrics.items():
 
             # Extend metrics with static and dynamic configuration
-            metrics = [{**timestamp, **static_config, **dynamic_config, **metric} for metric in metrics]
+            metrics = [{**timestamp, **static_config, **dynamic_config, **metric, "gpu": gpu} for metric in metrics]
 
             # Save results
             if args.save:
@@ -217,7 +214,6 @@ def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    set_start_method('spawn')
     parser = argparse.ArgumentParser()
 
     # Static arguments

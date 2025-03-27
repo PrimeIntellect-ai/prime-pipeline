@@ -2,6 +2,7 @@ from time import perf_counter
 from typing import Optional, Tuple
 
 import torch
+import os
 
 from .comm import setup_comm
 from .logger import setup_logger
@@ -35,6 +36,9 @@ def setup(
     """
     # Setup world
     world = setup_world(rank, world_size)
+
+    # Set OMP_NUM_THREADS
+    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // world_size)
 
     # Initialize logger
     logger = setup_logger(rank=rank, log_level=log_level)
