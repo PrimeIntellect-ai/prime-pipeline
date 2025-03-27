@@ -315,10 +315,12 @@ class Transformer(nn.Module):
             if dummy:
                 logger.info(f"Creating dummy model for {model_name}")
                 with torch.no_grad():
-                    model = cls(ModelArgs.from_name(model_name)).to(dtype=torch.bfloat16)
-                model_path.parent.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Saving dummy model to {model_path}")
-                torch.save(model.state_dict(), model_path)
+                    # Materialize the model from the meta device
+                    model = model.to_empty(device="cpu")
+                    model = model.to(dtype=torch.bfloat16)
+                    model_path.parent.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"Saving dummy model to {model_path}")
+                    torch.save(model.state_dict(), model_path)
             else:
                 # Download the model and convert it to a .pth file
                 logger.info(f"Downloading model {model_name}")
