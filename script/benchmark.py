@@ -72,6 +72,7 @@ def run_benchmark(
     # Populate environment variables for multi-node setup
     assert rank in IROH_PAIRS, f"Node {rank} is not in the list of known nodes: {IROH_PAIRS.keys()}"
     os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["CACHE_DIR"] = "/workspace"
     if backend == "iroh":
@@ -82,6 +83,7 @@ def run_benchmark(
     start_setup = perf_counter()
     model, _, decoded_tokens, num_prompt_tokens, micro_batch_size = setup(
         rank=rank,
+        local_rank=local_rank,
         world_size=world_size,
         log_level=log_level,
         seed=seed,

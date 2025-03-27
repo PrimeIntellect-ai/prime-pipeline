@@ -3,7 +3,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import numpy as np
 import torch
@@ -24,8 +24,7 @@ def seed_everything(seed: int) -> None:
 
 def get_device(device: str, world: World) -> torch.device:
     if device == "cuda":
-        local_rank = os.getenv("LOCAL_RANK", world.rank % torch.cuda.device_count())
-        return torch.device(f"cuda:{local_rank}")
+        return torch.device(f"cuda:{world.local_rank}")
     elif device == "cpu":
         return torch.device("cpu")
     else:
@@ -44,6 +43,13 @@ def get_precision(precision: str) -> torch.dtype:
 def get_tokenizer(model_name):
     return AutoTokenizer.from_pretrained(model_name)
 
+def to_int_or_none(value: str) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 def mean(values: List[float]) -> float:
     return np.mean(values) if len(values) > 0 else 0

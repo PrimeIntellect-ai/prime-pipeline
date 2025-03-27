@@ -2,8 +2,9 @@ from typing import Optional
 
 
 class World:
-    def __init__(self, rank: Optional[int] = None, size: Optional[int] = None):
+    def __init__(self, rank: Optional[int] = None, local_rank: Optional[int] = None, size: Optional[int] = None):
         self.rank = rank if rank is not None else 0
+        self.local_rank = local_rank if local_rank is not None else self.rank
         self.size = size if size is not None else 1
 
     @property
@@ -37,7 +38,7 @@ def get_world() -> World:
     return _WORLD
 
 
-def setup_world(rank: int, size: int) -> None:
+def setup_world(rank: int, local_rank: int, size: int) -> None:
     global _WORLD
-    _WORLD = World(rank, size)
+    _WORLD = World(rank, local_rank, size)
     return _WORLD
