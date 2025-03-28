@@ -1,7 +1,7 @@
-import os
 import math
+import os
 from dataclasses import dataclass
-from typing import Optional, Union, Tuple, Any, Dict
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -106,20 +106,32 @@ class ModelArgs:
             return cls(**MODEL_REGISTRY[name.lower()])
         raise ValueError(f"Model {name} is not yet supported.")
 
+
 def is_power_of_two(n: int) -> bool:
     return (n & (n - 1)) == 0
 
+
 def next_power_of_two(n: int) -> int:
     return 1 << (n - 1).bit_length()
+
+
+# Always compile flex_attention
+# From: https://github.com/PrimeIntellect-ai/prime/blob/d57965b04574262815a174246707afd9615eed0c/src/zeroband/models/llama/model.py#L27
+_flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+
+
+@torch.compiler.disable(recursive=False)
+def flex_attention_compiled(*args, **kwargs) -> torch.Tensor:
+    return _flex_attention_compiled(*args, **kwargs)
 
 
 # from: https://github.com/pytorch/pytorch/issues/143117
 # compilation args taken from https://github.com/pytorch/pytorch/issues/142817
 def modded_flex_attention(
     query: Tensor,  # (B, Hq, L, E)
-    key: Tensor,    # (B, Hkv, S, E)
+    key: Tensor,  # (B, Hkv, S, E)
     value: Tensor,  # (B, Hkv, S, E)
-    score_mod = None,
+    score_mod=None,
     block_mask: Optional[BlockMask] = None,
     scale: Optional[float] = None,
     enable_gqa: bool = False,
@@ -141,13 +153,22 @@ def modded_flex_attention(
         new_n_q_heads = n_q_heads + n_groups * extra_heads_per_group
 
         # for each group, append extra_heads_per_group of fake heads
-        query = torch.concat([
-            query.view(batch_size, n_groups, group_size, q_len, head_dims),
-            query.new_zeros(batch_size, n_groups, extra_heads_per_group, q_len, head_dims),
-        ], dim=2).view(batch_size, new_n_q_heads, q_len, head_dims).contiguous()
+        query = (
+            torch.concat(
+                [
+                    query.view(batch_size, n_groups, group_size, q_len, head_dims),
+                    query.new_zeros(batch_size, n_groups, extra_heads_per_group, q_len, head_dims),
+                ],
+                dim=2,
+            )
+            .view(batch_size, new_n_q_heads, q_len, head_dims)
+            .contiguous()
+        )
 
-        result = flex_attention(
-            query, key, value,
+        result = flex_attention_compiled(
+            query,
+            key,
+            value,
             score_mod=score_mod,
             block_mask=block_mask,
             scale=scale,
@@ -165,8 +186,10 @@ def modded_flex_attention(
         return attn_out if not return_lse else (attn_out, result[1])
 
     # If no padding is needed, just run flex_attention directly
-    return flex_attention(
-        query, key, value,
+    return flex_attention_compiled(
+        query,
+        key,
+        value,
         score_mod=score_mod,
         block_mask=block_mask,
         scale=scale,
@@ -299,8 +322,8 @@ class Transformer(nn.Module):
 
         from huggingface_hub import snapshot_download
 
-        from .utils import convert_model
         from .logger import get_logger
+        from .utils import convert_model
 
         logger = get_logger()
 
