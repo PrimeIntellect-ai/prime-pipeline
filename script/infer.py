@@ -8,8 +8,8 @@ from src.comm import get_comm
 from src.generate import generate
 from src.logger import get_logger
 from src.setup import setup
+from src.utils import discard_initial_tokens, flatten_list, mean, to_int_or_none
 from src.world import get_world
-from src.utils import to_int_or_none, flatten_list, mean, discard_initial_tokens
 
 # Use lovely tensors
 monkey_patch()
@@ -53,12 +53,14 @@ def main(args: argparse.Namespace) -> None:
     if world.is_master:
         for batch_idx, generation in enumerate(decoded_tokens):
             logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist(), skip_special_tokens=True)}")
-        
+
     num_discard_tokens = 5
     decode_times = discard_initial_tokens(decode_metrics["times"], num_discard_tokens)
     forward_times = discard_initial_tokens(decode_metrics["forward_times"], num_discard_tokens)
     wait_times = discard_initial_tokens(decode_metrics["wait_times"], num_discard_tokens)
-    logger.info(f"Decode throughput: {len(decode_times) / sum(flatten_list(decode_times)):.02f} tokens/second (avg. of last {len(decode_times)} generations)")
+    logger.info(
+        f"Decode throughput: {(len(decode_times) * args.batch_size) / sum(flatten_list(decode_times)):.02f} tokens/second (avg. of last {len(decode_times)} generations)"
+    )
     logger.info(f"Mean decode time: {(mean(flatten_list(decode_times)) * 1000):.02f}ms ")
     logger.info(f"Mean decode forward time: {(mean(flatten_list(forward_times)) * 1000):.02f}ms ")
     logger.info(f"Mean decode wait time: {(mean(flatten_list(wait_times)) * 1000):.02f}ms ")

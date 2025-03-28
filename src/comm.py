@@ -1,6 +1,8 @@
 import os
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
+from threading import Thread
 from typing import Optional, Union
 
 import torch
@@ -8,6 +10,7 @@ import torch.distributed as dist
 from iroh_py import Node, RecvWork, SendWork
 
 from .logger import get_logger
+from .offload import Offload
 from .serializer import Serializer
 from .world import get_world
 
@@ -19,11 +22,13 @@ class WorkBase(ABC):
         work: Union[SendWork, RecvWork, dist.Work],
         device: torch.device,
         serializer: Optional[Serializer] = None,
+        offload: Optional[Offload] = None,
     ):
         self.tensor = tensor
         self.work = work
         self.device = device
         self.serializer = serializer
+        self.offload = offload
 
     def deserialize(self, tensor: Union[bytes, torch.Tensor]) -> torch.Tensor:
         """Deserializes a tensor if a serializer is provided"""
@@ -34,7 +39,10 @@ class WorkBase(ABC):
     def move_to_device(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Moves a tensor to the correct device"""
         if isinstance(tensor, torch.Tensor):
-            return tensor.to(self.device)
+            t0 = time.perf_counter()
+            tensor = tensor.to(self.device)
+            get_logger().debug(f"Move to device took {(time.perf_counter() - t0) * 1000:.02f}ms")
+            return tensor
         return tensor
 
     @abstractmethod
@@ -43,9 +51,10 @@ class WorkBase(ABC):
 
 
 class P2PCommBase(ABC):
-    def __init__(self, device: torch.device, serializer: Optional[Serializer] = None):
+    def __init__(self, device: torch.device, serializer: Optional[Serializer] = None, offload: Optional[Offload] = None):
         self.world = get_world()
         self.serializer = serializer
+        self.offload = offload
         self.device = device
 
     @abstractmethod
@@ -68,13 +77,13 @@ class P2PCommBase(ABC):
         """Sends tensor (hidden states or next token) to the correct next rank"""
         work = self.isend(tensor, tag)
         if work:
-            work.wait()
+            work.result()
 
     def recv(self, tag: int, prefill: bool = False) -> Optional[torch.Tensor]:
         """Receives tensor (hidden states or next token) from the correct previous rank"""
         work = self.irecv(tag, prefill=prefill)
         if work:
-            return work.wait()
+            return work.result()
 
 
 _COMM: Optional[P2PCommBase] = None
@@ -127,9 +136,10 @@ class TorchP2PComm(P2PCommBase):
         bwd_dtype: torch.dtype,
         num_prompt_tokens: int,
         device: torch.device,
-        serializer: Optional[Serializer] = None,
+        serializer: Optional[Serializer],
+        offload: Optional[Offload],
     ):
-        super().__init__(device, serializer)
+        super().__init__(device, serializer, offload)
         self.logger = get_logger()
         self.fwd_shape, self.bwd_shape = fwd_shape, bwd_shape
         self.fwd_prefill_shape = (fwd_shape[0], num_prompt_tokens, fwd_shape[2])
@@ -139,29 +149,74 @@ class TorchP2PComm(P2PCommBase):
         if self.world.size <= 1:
             return
         self._setup()
+        self.transfer_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def _setup(self):
         dist.init_process_group(init_method="tcp://localhost:29500", rank=self.world.rank, world_size=self.world.size, backend="gloo")
 
-    def isend(self, tensor: torch.Tensor, tag: int) -> Optional[TorchWork]:
-        """Sends tensor (hidden states or next token) to the correct next rank"""
+    def isend(self, tensor: torch.Tensor, tag: int) -> Future:
         if self.world.size <= 1:
             return None
         dst = self.world.first_stage_rank if self.world.is_last_stage else self.world.rank + 1
-        self.logger.debug(f"isend({tensor=}, {tag=}, {dst=})")
-        return TorchWork(None, dist.isend(tensor.cpu(), dst=dst, tag=tag), self.device)
 
-    def irecv(self, tag: int, prefill: bool = False) -> Optional[TorchWork]:
+        future = Future()
+
+        def _worker():
+            try:
+                # Move tensor to CPU synchronously
+                cpu_tensor = self.offload.to_cpu(tensor)
+
+                # Send tensor synchronously
+                req = dist.isend(cpu_tensor, dst=dst, tag=tag)
+
+                # Create a completion watcher thread
+                def _completion_watcher():
+                    req.wait()
+                    future.set_result(True)
+
+                watcher = Thread(target=_completion_watcher, daemon=True)
+                watcher.start()
+            except Exception as e:
+                future.set_exception(e)
+
+        worker = Thread(target=_worker, daemon=True)
+        worker.start()
+
+        return future
+
+    def irecv(self, tag: int, prefill: bool = False) -> Future:
         """Receives tensor (hidden states or next token) from the correct previous rank"""
         if self.world.size <= 1:
             return None
         shape = (self.bwd_shape, self.bwd_prefill_shape) if self.world.is_first_stage else (self.fwd_shape, self.fwd_prefill_shape)
         dtype = self.bwd_dtype if self.world.is_first_stage else self.fwd_dtype
         src = self.world.last_stage_rank if self.world.is_first_stage else self.world.rank - 1
-        # TODO: Gloo complains if initialized as torch.empty (performance hit?)
-        tensor = torch.zeros(shape[int(prefill)], dtype=dtype, device="cpu")
-        self.logger.debug(f"irecv({tensor=}, {tag=}, {src=})")
-        return TorchWork(tensor, dist.irecv(tensor, src=src, tag=tag), self.device)
+
+        future = Future()
+
+        def _worker():
+            try:
+                # Create buffer (TODO: Gloo complains if initialized as torch.empty (performance hit?)
+                cpu_tensor = torch.zeros(shape[int(prefill)], dtype=dtype)
+
+                # Receive tensor synchronously
+                req = dist.irecv(cpu_tensor, src=src, tag=tag)
+
+                # Create a completion watcher thread
+                def _completion_watcher():
+                    req.wait()
+                    gpu_tensor = self.offload.to_gpu(cpu_tensor)
+                    future.set_result(gpu_tensor)
+
+                watcher = Thread(target=_completion_watcher, daemon=True)
+                watcher.start()
+            except Exception as e:
+                future.set_exception(e)
+
+        worker = Thread(target=_worker, daemon=True)
+        worker.start()
+
+        return future
 
     def destroy(self):
         if dist.is_initialized():
@@ -211,13 +266,13 @@ class IrohP2PComm(P2PCommBase):
     def irecv(self, tag: int, **kwargs) -> Optional[IrohWork]:
         if self.world.size <= 1:
             return None
-        self.logger.debug(f"irecv({tag=})")
+        # self.logger.debug(f"irecv({tag=})")
         return IrohWork(self.node.irecv(tag), self.device, self.serializer)
 
     def isend(self, tensor: torch.Tensor, tag: int, **kwargs) -> Optional[IrohWork]:
         if self.world.size <= 1:
             return None
-        self.logger.debug(f"isend({tensor=}, {tag=}")
+        # self.logger.debug(f"isend({tensor=}, {tag=}")
         return IrohWork(self.node.isend(self.serializer.serialize(tensor), tag, self.latency), self.device, self.serializer)
 
     def destroy(self):

@@ -5,14 +5,14 @@ import torch
 import torch._dynamo.config
 import torch._inductor.config
 import torch.nn as nn
-from tqdm import tqdm
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from tqdm import tqdm
 
 from .comm import get_comm
 from .logger import get_logger
-from .world import get_world
 from .utils import flatten_list
+from .world import get_world
 
 # Setup compile flags
 torch._inductor.config.coordinate_descent_tuning = True
@@ -195,7 +195,7 @@ def prefill(
     # Wait for all outstanding sends
     for send_req in send_reqs:
         if send_req is not None:
-            send_req.wait()
+            send_req.result()
 
     return {
         "times": [prefill_times],
@@ -282,6 +282,7 @@ def decode(
                     input_pos,
                 )
                 next_token = sample(logits, **sampling_kwargs)
+                torch.cuda.synchronize()
                 forward_time = perf_counter() - start_forward
                 logger.debug(f"Forward for {token_idx=} {micro_batch_idx=} took {forward_time * 1000:.2f}ms")
                 wait_times[i].append(0)
@@ -289,7 +290,7 @@ def decode(
                 decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
                 decode_times[i].append(perf_counter() - start_decode)
                 if use_tqdm:
-                    pbar.set_description(f"T/s: {(i+1) * batch_size / sum(flatten_list(decode_times)):.2f}")
+                    pbar.set_description(f"T/s: {(i + 1) * batch_size / sum(flatten_list(decode_times)):.2f}")
                     pbar.update()
     # Multi-node
     else:
@@ -310,7 +311,9 @@ def decode(
                     cur_tokens,
                     input_pos,
                 )
+                torch.cuda.synchronize()
                 forward_time = perf_counter() - start_forward
+                logger.debug(f"Forward for {starting_pos=} {micro_batch_idx=} took {forward_time * 1000:.2f}ms")
                 forward_times[0].append(forward_time)
                 send_reqs[micro_batch_idx] = comm.isend(hidden_states, tag=micro_batch_idx)
             recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
@@ -328,17 +331,19 @@ def decode(
                 if world.is_first_stage:
                     start_idx = micro_batch_idx * micro_batch_size
                     end_idx = start_idx + micro_batch_size
-                    next_token = recv_reqs[micro_batch_idx].wait()
+                    next_token = recv_reqs[micro_batch_idx].result()
+                    t0 = perf_counter()
                     decoded_tokens[start_idx:end_idx, token_idx] = next_token.squeeze()
+                    get_logger().debug(f"Save result took {(perf_counter() - t0) * 1000:.02f}ms")
                     decode_times[i].append(perf_counter() - start_decode)
                 else:
                     # start_recv = perf_counter()
                     # hidden_states = comm.recv(tag=micro_batch_idx)
-                    hidden_states = recv_reqs[micro_batch_idx].wait()
-                start_decode = perf_counter()
+                    hidden_states = recv_reqs[micro_batch_idx].result()
                 wait_time = perf_counter() - start_recv
                 wait_times[i].append(wait_time)
                 logger.debug(f"Wait for recv {token_idx=} {micro_batch_idx=} took {wait_time * 1000:.2f}ms")
+                start_decode = perf_counter()
 
                 # Skip forward and send on last iteration for first stage
                 if world.is_first_stage and token_idx == decoded_tokens.size(-1) - 1:
@@ -368,7 +373,9 @@ def decode(
 
                 # Record decode time
                 if not world.is_first_stage:
-                    decode_times[i].append(perf_counter() - start_decode)
+                    decode_time = perf_counter() - start_decode
+                    decode_times[i].append(decode_time)
+                    logger.debug(f"Decode {token_idx=} {micro_batch_idx=} took {decode_time * 1000:.2f}ms")
 
                 # Skip recv on last iteration
                 if not world.is_first_stage and token_idx == decoded_tokens.size(-1) - 1:
@@ -378,14 +385,13 @@ def decode(
                 recv_reqs[micro_batch_idx] = comm.irecv(tag=micro_batch_idx)
                 start_recv = perf_counter()
             if world.is_master and use_tqdm:
-                pbar.set_description(f"T/s: {(i+1) * batch_size / sum(flatten_list(decode_times)):.2f}")
+                pbar.set_description(f"T/s: {(i + 1) * batch_size / sum(flatten_list(decode_times)):.2f}")
                 pbar.update()
-
 
     # Finish all outstanding sends
     for send_req in send_reqs:
         if send_req:
-            send_req.wait()
+            send_req.result()
 
     return {
         "times": decode_times,
@@ -394,7 +400,8 @@ def decode(
         "num_new_tokens": batch_size * len(token_idxs),
     }
 
-def compile_model():
+
+def compile_model(compile):
     """Compile the model"""
     global create_block_mask
     create_block_mask = torch.compile(create_block_mask, fullgraph=True)
@@ -403,7 +410,8 @@ def compile_model():
     adjust_mask = torch.compile(adjust_mask, fullgraph=True)
 
     global model_forward
-    model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
+    model_forward = torch.compile(model_forward)
+
 
 @torch.no_grad()
 def generate(

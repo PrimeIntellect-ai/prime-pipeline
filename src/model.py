@@ -117,10 +117,10 @@ def next_power_of_two(n: int) -> int:
 
 # Always compile flex_attention
 # From: https://github.com/PrimeIntellect-ai/prime/blob/d57965b04574262815a174246707afd9615eed0c/src/zeroband/models/llama/model.py#L27
-_flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+_flex_attention_compiled = torch.compile(flex_attention)
 
 
-@torch.compiler.disable(recursive=False)
+# @torch.compiler.disable(recursive=False)
 def flex_attention_compiled(*args, **kwargs) -> torch.Tensor:
     return _flex_attention_compiled(*args, **kwargs)
 

@@ -1,16 +1,18 @@
+import os
 from time import perf_counter
 from typing import Optional, Tuple
 
 import torch
-import os
 
 from .comm import setup_comm
+from .generate import compile_model
 from .logger import setup_logger
 from .model import get_model, get_model_shard
+from .offload import get_offload
 from .serializer import get_serializer
 from .utils import get_device, get_precision, get_tokenizer, seed_everything
 from .world import setup_world
-from .generate import compile_model, generate
+
 
 def setup(
     rank: int,
@@ -78,12 +80,16 @@ def setup(
     # Setup model cache
     assert batch_size >= num_micro_batches, "Batch size must be at least as large as number of micro batches"
     assert batch_size % num_micro_batches == 0, f"Batch size {batch_size} must be divisible by number of micro batches {num_micro_batches}"
-    micro_batch_size = batch_size // num_micro_batches 
+    micro_batch_size = batch_size // num_micro_batches
     num_total_tokens = num_prompt_tokens + num_new_tokens
-    assert num_total_tokens <= model.config.block_size, f"Total tokens {num_total_tokens} must be less than or equal to model block size {model.config.block_size}"
+    assert num_total_tokens <= model.config.block_size, (
+        f"Total tokens {num_total_tokens} must be less than or equal to model block size {model.config.block_size}"
+    )
     if num_cache_tokens == 0:
         num_cache_tokens = num_total_tokens
-    assert num_cache_tokens >= num_total_tokens, f"Number of cache tokens {num_cache_tokens} must be greater than or equal to total tokens {num_total_tokens}"
+    assert num_cache_tokens >= num_total_tokens, (
+        f"Number of cache tokens {num_cache_tokens} must be greater than or equal to total tokens {num_total_tokens}"
+    )
     logger.info(f"Setting up KV cache for {num_cache_tokens} tokens...")
     t0 = perf_counter()
     with torch.device(device):
@@ -111,6 +117,8 @@ def setup(
             bwd_dtype=tokens_dtype,
             device=device,
             num_prompt_tokens=num_prompt_tokens,
+            serializer=get_serializer(),
+            offload=get_offload(device),
         )
     elif backend == "iroh":
         serializer = get_serializer()
@@ -128,6 +136,7 @@ def setup(
     # Compile model
     if compile:
         logger.info("Compiling model...")
-        compile_model()
+        compile_model(compile=compile)
+        logger.info("Model compiled")
 
     return model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size
