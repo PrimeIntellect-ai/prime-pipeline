@@ -13,7 +13,7 @@ def setup_logger(rank: int, log_level: str = "INFO"):
     loguru_logger.remove()  # Remove default handlers
     loguru_logger.add(
         sys.stdout,
-        format=f"[Rank {rank}] <green>{{time:YYYY-MM-DD HH:mm:ss}}</green> | <level>{{level}}</level> | <cyan>{{name}}</cyan>:<cyan>{{function}}</cyan>:<cyan>{{line}}</cyan> - <level>{{message}}</level>",
+        format=f"[Rank {rank}] <green>{{time:YYYY-MM-DD HH:mm:ss}}</green> | <cyan>PID:{{process}}</cyan> | <yellow>TID:{{thread}}</yellow> | <level>{{level}}</level> | <cyan>{{name}}</cyan>:<cyan>{{function}}</cyan>:<cyan>{{line}}</cyan> - <level>{{message}}</level>",
         colorize=True,
         enqueue=True,  # Ensures thread/process safety
         level=log_level,

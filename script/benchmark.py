@@ -15,7 +15,6 @@ from lovely_tensors import monkey_patch
 from tabulate import tabulate
 
 from src.generate import generate
-from src.logger import get_logger
 from src.setup import setup
 from src.utils import flatten_list, mean
 
@@ -67,14 +66,14 @@ def run_benchmark(
     warmup: bool,
     seed: int,
     log_level: str,
-    **kwargs
+    **kwargs,
 ) -> None:
     # Populate environment variables for multi-node setup
     assert rank in IROH_PAIRS, f"Node {rank} is not in the list of known nodes: {IROH_PAIRS.keys()}"
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["CACHE_DIR"] = "/workspace"
+    os.environ["CACHE_DIR"] = os.environ.get("CACHE_DIR", "/ephemeral")
     if backend == "iroh":
         os.environ["IROH_SEED"] = str(rank)
         os.environ["IROH_PEER_ID"] = IROH_PAIRS[(rank + 1) % world_size]
@@ -133,6 +132,7 @@ def run_benchmark(
     # Send metrics to main process
     queue.put((rank, torch.cuda.get_device_name(), metrics))
 
+
 def main(args: argparse.Namespace) -> None:
     # Prepare static configuration to identify benchmark run
     timestamp = {
@@ -152,7 +152,7 @@ def main(args: argparse.Namespace) -> None:
     # Get static and dynamic arguments
     dynamic_args = {arg: getattr(args, arg) for arg in vars(args) if isinstance(getattr(args, arg), list)}
     static_config = {arg: getattr(args, arg) for arg in vars(args) if not isinstance(getattr(args, arg), list)}
-    
+
     file_path = Path(f"benchmark/{args.model_name}.jsonl")
     if args.save:
         os.makedirs(file_path.parent, exist_ok=True)
@@ -172,7 +172,10 @@ def main(args: argparse.Namespace) -> None:
         # Run benchmark
         try:
             queue = Queue()
-            ps = [Process(target=run_benchmark, args=(rank, queue), kwargs={**static_config, **dynamic_config}) for rank in range(args.world_size)]
+            ps = [
+                Process(target=run_benchmark, args=(rank, queue), kwargs={**static_config, **dynamic_config})
+                for rank in range(args.world_size)
+            ]
             for p in ps:
                 p.start()
             for p in ps:
@@ -191,7 +194,6 @@ def main(args: argparse.Namespace) -> None:
 
         # Aggregate metrics
         for rank, metrics in all_metrics.items():
-
             # Extend metrics with static and dynamic configuration
             metrics = [{**timestamp, **static_config, **dynamic_config, **metric, "gpu": gpu} for metric in metrics]
 
@@ -206,7 +208,6 @@ def main(args: argparse.Namespace) -> None:
         aggregated_metrics = {key: mean([result[key] for result in all_metrics[0]]) for key in metrics_to_aggregate}
         aggregated_results.append(aggregated_metrics)
 
-
     # Display aggregated results
     headers = ["config_idx"] + list(aggregated_results[0].keys())
     table = [[config_idx] + list(result.values()) for config_idx, result in enumerate(aggregated_results, start=1)]
@@ -220,7 +221,7 @@ if __name__ == "__main__":
 
     # Static arguments
     parser.add_argument("--model-name", type=str, default="meta-llama/llama-2-7b-chat-hf", help="HF model name.")
-    parser.add_argument("--local-rank", type=int, default=0, help="Sets local rank in CUDA process.")
+    parser.add_argument("--local-rank", type=int, default=None, help="Sets local rank in CUDA process.")
     parser.add_argument("--world-size", type=int, default=1, help="Number of pipeline stages.")
     parser.add_argument("--num-iterations", type=int, default=3, help="Number of samples to generate.")
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Prompt to generate from.")
@@ -267,4 +268,3 @@ if __name__ == "__main__":
     args.compile = [True if compile == "True" else False for compile in args.compile]
 
     main(args)
-
