@@ -128,24 +128,9 @@ class TorchWork(WorkBase):
 
 
 class TorchP2PComm(P2PCommBase):
-    def __init__(
-        self,
-        fwd_shape: tuple[int, ...],
-        bwd_shape: tuple[int, ...],
-        fwd_dtype: torch.dtype,
-        bwd_dtype: torch.dtype,
-        num_prompt_tokens: int,
-        device: torch.device,
-        serializer: Optional[Serializer],
-        offload: Optional[Offload],
-    ):
+    def __init__(self, device: torch.device, serializer: Optional[Serializer], offload: Optional[Offload], **kwargs):
         super().__init__(device, serializer, offload)
         self.logger = get_logger()
-        self.fwd_shape, self.bwd_shape = fwd_shape, bwd_shape
-        self.fwd_prefill_shape = (fwd_shape[0], num_prompt_tokens, fwd_shape[2])
-        self.bwd_prefill_shape = bwd_shape
-        self.fwd_dtype, self.bwd_dtype = fwd_dtype, bwd_dtype
-        self.num_prompt_tokens = num_prompt_tokens
         if self.world.size <= 1:
             return
         self._setup()
@@ -156,8 +141,9 @@ class TorchP2PComm(P2PCommBase):
 
     def isend(self, tensor: torch.Tensor, tag: int) -> Future:
         if self.world.size <= 1:
-            return None
+            return Future().set_result(True)
         dst = self.world.first_stage_rank if self.world.is_last_stage else self.world.rank + 1
+        self.logger.debug(f"Sending tensor {tensor=} to {dst=}")
 
         future = Future()
 
@@ -184,20 +170,24 @@ class TorchP2PComm(P2PCommBase):
 
         return future
 
-    def irecv(self, tag: int, prefill: bool = False) -> Future:
+    def irecv(
+        self,
+        tag: int,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> Future:
         """Receives tensor (hidden states or next token) from the correct previous rank"""
         if self.world.size <= 1:
-            return None
-        shape = (self.bwd_shape, self.bwd_prefill_shape) if self.world.is_first_stage else (self.fwd_shape, self.fwd_prefill_shape)
-        dtype = self.bwd_dtype if self.world.is_first_stage else self.fwd_dtype
+            return Future().set_result(True)
         src = self.world.last_stage_rank if self.world.is_first_stage else self.world.rank - 1
+        self.logger.debug(f"Receiving tensor from {src=}")
 
         future = Future()
 
         def _worker():
             try:
                 # Create buffer (TODO: Gloo complains if initialized as torch.empty (performance hit?)
-                cpu_tensor = torch.zeros(shape[int(prefill)], dtype=dtype)
+                cpu_tensor = torch.zeros(shape, dtype=dtype)
 
                 # Receive tensor synchronously
                 req = dist.irecv(cpu_tensor, src=src, tag=tag)
@@ -235,8 +225,10 @@ class IrohWork(WorkBase):
 
 
 class IrohP2PComm(P2PCommBase):
-    def __init__(self, device: torch.device, serializer: Serializer, num_micro_batches: int, latency: int = 0):
-        super().__init__(device, serializer)
+    def __init__(
+        self, device: torch.device, serializer: Serializer, offloader: Offload, num_micro_batches: int, latency: int = 0, **kwargs
+    ):
+        super().__init__(device, serializer, offloader, **kwargs)
         self.logger = get_logger()
         self.num_micro_batches, self.latency = num_micro_batches, latency
         if self.world.size <= 1:

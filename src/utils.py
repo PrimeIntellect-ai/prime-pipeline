@@ -1,7 +1,8 @@
-import os
 import json
+import os
 import re
 import shutil
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -43,6 +44,7 @@ def get_precision(precision: str) -> torch.dtype:
 def get_tokenizer(model_name):
     return AutoTokenizer.from_pretrained(model_name)
 
+
 def to_int_or_none(value: str) -> Optional[int]:
     if value is None:
         return None
@@ -51,6 +53,13 @@ def to_int_or_none(value: str) -> Optional[int]:
     except ValueError:
         return None
 
+
+def fake_future(result: Any) -> Future:
+    future = Future()
+    future.set_result(result)
+    return future
+
+
 def mean(values: List[float]) -> float:
     return np.mean(values) if len(values) > 0 else 0
 
@@ -58,6 +67,7 @@ def mean(values: List[float]) -> float:
 def flatten_list(list_of_lists: List[List[Any]]) -> List[Any]:
     """Flatten a list of lists into a single list."""
     return [item for sublist in list_of_lists for item in sublist]
+
 
 def discard_initial_tokens(decoded_tokens: List, num_discard_tokens: int) -> List:
     """Discard the initial tokens from the decoded tokens."""

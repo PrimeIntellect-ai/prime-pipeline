@@ -1,14 +1,16 @@
 import argparse
 import os
+from time import perf_counter
 
 import autorootcwd  # noqa: F401
+import torch
 from lovely_tensors import monkey_patch
 
 from src.comm import get_comm
 from src.generate import generate
 from src.logger import get_logger
 from src.setup import setup
-from src.utils import discard_initial_tokens, flatten_list, mean, to_int_or_none
+from src.utils import to_int_or_none
 from src.world import get_world
 
 # Use lovely tensors
@@ -40,7 +42,9 @@ def main(args: argparse.Namespace) -> None:
     world, logger, comm = get_world(), get_logger(), get_comm()
 
     # Generate
-    decoded_tokens, _, decode_metrics = generate(
+    torch.cuda.synchronize()
+    t0 = perf_counter()
+    decoded_tokens, _, _ = generate(
         model=model,
         decoded_tokens=decoded_tokens,
         num_prompt_tokens=num_prompt_tokens,
@@ -49,21 +53,25 @@ def main(args: argparse.Namespace) -> None:
         temperature=args.temperature,
         top_k=args.top_k,
     )
+    time_taken = perf_counter() - t0
+    logger.info(f"Time taken: {time_taken:.02f}s")
+    logger.info(f"Tokens generated: {args.batch_size * args.num_new_tokens}")
+    logger.info(f"Tokens per second: {(args.batch_size * args.num_new_tokens) / time_taken:.02f}")
 
     if world.is_master:
         for batch_idx, generation in enumerate(decoded_tokens):
             logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist(), skip_special_tokens=True)}")
 
-    num_discard_tokens = 5
-    decode_times = discard_initial_tokens(decode_metrics["times"], num_discard_tokens)
-    forward_times = discard_initial_tokens(decode_metrics["forward_times"], num_discard_tokens)
-    wait_times = discard_initial_tokens(decode_metrics["wait_times"], num_discard_tokens)
-    logger.info(
-        f"Decode throughput: {(len(decode_times) * args.batch_size) / sum(flatten_list(decode_times)):.02f} tokens/second (avg. of last {len(decode_times)} generations)"
-    )
-    logger.info(f"Mean decode time: {(mean(flatten_list(decode_times)) * 1000):.02f}ms ")
-    logger.info(f"Mean decode forward time: {(mean(flatten_list(forward_times)) * 1000):.02f}ms ")
-    logger.info(f"Mean decode wait time: {(mean(flatten_list(wait_times)) * 1000):.02f}ms ")
+    # num_discard_tokens = 5
+    # decode_times = discard_initial_tokens(decode_metrics["times"], num_discard_tokens)
+    # forward_times = discard_initial_tokens(decode_metrics["forward_times"], num_discard_tokens)
+    # wait_times = discard_initial_tokens(decode_metrics["wait_times"], num_discard_tokens)
+    # logger.info(
+    #     f"Decode throughput: {(len(decode_times) * args.batch_size) / sum(flatten_list(decode_times)):.02f} tokens/second (avg. of last {len(decode_times)} generations)"
+    # )
+    # logger.info(f"Mean decode time: {(mean(flatten_list(decode_times)) * 1000):.02f}ms ")
+    # logger.info(f"Mean decode forward time: {(mean(flatten_list(forward_times)) * 1000):.02f}ms ")
+    # logger.info(f"Mean decode wait time: {(mean(flatten_list(wait_times)) * 1000):.02f}ms ")
 
     # Destroy communication
     comm.destroy()

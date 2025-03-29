@@ -120,7 +120,7 @@ def next_power_of_two(n: int) -> int:
 _flex_attention_compiled = torch.compile(flex_attention)
 
 
-# @torch.compiler.disable(recursive=False)
+@torch.compiler.disable(recursive=False)
 def flex_attention_compiled(*args, **kwargs) -> torch.Tensor:
     return _flex_attention_compiled(*args, **kwargs)
 

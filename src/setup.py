@@ -1,11 +1,13 @@
 import os
+from concurrent.futures import Future
 from time import perf_counter
 from typing import Optional, Tuple
 
 import torch
+from torch.nn.attention.flex_attention import create_block_mask
 
 from .comm import setup_comm
-from .generate import compile_model
+from .generate import adjust_mask, causal_mask, compile_generate, micro_step
 from .logger import setup_logger
 from .model import get_model, get_model_shard
 from .offload import get_offload
@@ -104,39 +106,87 @@ def setup(
     decoded_tokens = torch.empty(batch_size, num_total_tokens, dtype=prompt_tokens.dtype, device=device)
     decoded_tokens[:, :num_prompt_tokens] = prompt_tokens
 
+    # Setup serializer
+    logger.info("Setting up serializer...")
+    serializer = get_serializer()
+
+    # Setup offload
+    logger.info("Setting up offloader...")
+    offloader = get_offload(device)
+
     # Setup communication
-    hidden_states_shape = (micro_batch_size, 1, model.config.dim)
-    tokens_shape = (micro_batch_size, 1)
-    hidden_states_dtype = model.layers[0].feed_forward.w1.weight.dtype
-    tokens_dtype = torch.long
-    if backend == "torch":
-        kwargs = dict(
-            fwd_shape=hidden_states_shape,
-            bwd_shape=tokens_shape,
-            fwd_dtype=hidden_states_dtype,
-            bwd_dtype=tokens_dtype,
-            device=device,
-            num_prompt_tokens=num_prompt_tokens,
-            serializer=get_serializer(),
-            offload=get_offload(device),
-        )
-    elif backend == "iroh":
-        serializer = get_serializer()
-        kwargs = dict(
-            serializer=serializer,
-            num_micro_batches=num_micro_batches,
-            latency=latency,
-            device=device,
-        )
-    else:
-        raise ValueError(f"Invalid backend: {backend}")
     logger.info(f"Setting up communication backend {backend}...")
-    setup_comm(backend, **kwargs)
+    setup_comm(backend, device=device, serializer=serializer, offload=offloader, latency=latency, num_micro_batches=num_micro_batches)
 
     # Compile model
+    logger.info("Compiling model...")
     if compile:
-        logger.info("Compiling model...")
-        compile_model(compile=compile)
-        logger.info("Model compiled")
+        compile_generate()
+    t0 = perf_counter()
+
+    # Fake prefill
+    with torch.no_grad():
+        logger.info("Faking prefill...")
+        input_pos = torch.arange(num_prompt_tokens, device=device)
+        if world.is_first_stage:
+            inputs = torch.randint(0, model.config.vocab_size, (micro_batch_size, num_prompt_tokens), device=device)
+        else:
+            inputs = torch.randn(micro_batch_size, num_prompt_tokens, model.config.dim, device=device, dtype=torch.bfloat16)
+        input_future = Future()
+        input_future.set_result(inputs)
+        block_mask = create_block_mask(
+            causal_mask,
+            1,
+            1,
+            input_pos.shape[0],
+            model.max_seq_length,
+            device=decoded_tokens.device,
+        )
+        for micro_batch_idx in range(num_micro_batches):
+            micro_step(
+                input_future,
+                model,
+                block_mask,
+                input_pos,
+                micro_batch_idx,
+                sampling_kwargs={},
+                recv_kwargs={},
+                skip_send=True,
+                skip_recv=True,
+            )
+
+        # Fake decode one step
+        logger.info("Faking decode step...")
+        block_mask = create_block_mask(
+            causal_mask,
+            1,
+            1,
+            model.max_seq_length,
+            model.max_seq_length,
+            device=device,
+        )
+        if world.is_first_stage:
+            inputs = torch.randint(0, model.config.vocab_size, (micro_batch_size, 1), device=device, dtype=torch.long)
+        else:
+            inputs = torch.randn(micro_batch_size, 1, model.config.dim, dtype=torch.bfloat16, device=device)
+        input_future = Future()
+        input_future.set_result(inputs)
+        for token_idx in range(3):
+            input_pos = torch.tensor([num_prompt_tokens + token_idx], device=device, dtype=torch.long)
+            mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
+            for micro_batch_idx in range(num_micro_batches):
+                micro_step(
+                    input_future,
+                    model,
+                    mask,
+                    input_pos,
+                    micro_batch_idx,
+                    sampling_kwargs={},
+                    recv_kwargs={},
+                    skip_send=True,
+                    skip_recv=True,
+                )
+
+    logger.info(f"Model compiled in {perf_counter() - t0} seconds")
 
     return model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size
