@@ -19,7 +19,6 @@ from .world import get_world
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True
-torch._functorch.config.enable_autograd_cache = True
 
 
 def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
@@ -111,7 +110,7 @@ def micro_step(
 
     # Forward pass + sample
     start_forward = perf_counter()
-    outputs = model(micro_batch_idx, mask, input_pos, inputs)
+    outputs = forward(model, micro_batch_idx, mask, input_pos, inputs)
     if world.is_last_stage:
         outputs = sample(outputs, **sampling_kwargs)
     torch.cuda.synchronize()
@@ -386,16 +385,22 @@ def generate(
     return decoded_tokens, prefill_time, decode_time
 
 
+@torch.no_grad()
+def forward(model: nn.Module, micro_batch_idx: int, mask: BlockMask, input_pos: Tensor, inputs: Tensor) -> Tensor:
+    """Forward pass for the model for torch.compile"""
+    return model(micro_batch_idx, mask, input_pos, inputs)
+
+
 def full_compile():
     """Compile block mask generation, adjustment and model forward pass"""
     global create_block_mask
-    create_block_mask = torch.compile(create_block_mask, fullgraph=True)
+    create_block_mask = torch.compile(create_block_mask)
 
     global adjust_mask
-    adjust_mask = torch.compile(adjust_mask, fullgraph=True)
+    adjust_mask = torch.compile(adjust_mask)
 
-    global model
-    model = torch.compile(model)
+    global forward
+    forward = torch.compile(forward)
 
 
 def fake_prefill(model: nn.Module, num_prompt_tokens: int, num_micro_batches: int, micro_batch_size: int):
