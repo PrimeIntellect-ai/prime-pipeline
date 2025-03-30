@@ -97,10 +97,12 @@ def micro_step(
     the stage worker). Sends and receives may be skipped, in which case the
     corresponding future is None.
     """
-    world, logger, comm = get_world(), get_logger(), get_comm()
+    world, logger = get_world(), get_logger()
 
     # Wait to receive next token or hidden states
+    start_recv = perf_counter()
     inputs = inputs.result()
+    logger.debug(f"Blocked for receiving {micro_batch_idx=} for {(perf_counter() - start_recv) * 1000:.02f}ms")
 
     # Save results on rank 0
     next_tokens = []
@@ -118,7 +120,9 @@ def micro_step(
     # Send outputs to next stage, unless otherwise specified
     send_future = None
     if not skip_send:
-        send_future = comm.isend(outputs, tag=micro_batch_idx)
+        start_send = perf_counter()
+        send_future = get_comm().isend(outputs, tag=micro_batch_idx)
+        logger.debug(f"Blocked for sending {micro_batch_idx=} for {(perf_counter() - start_send) * 1000:.02f}ms")
 
     # Schedule next receive, unless otherwise specified
     recv_future = None
@@ -126,7 +130,7 @@ def micro_step(
         if world.is_first_stage and world.is_last_stage:
             recv_future = fake_future(outputs)
         else:
-            recv_future = comm.irecv(tag=micro_batch_idx, **recv_kwargs)
+            recv_future = get_comm().irecv(tag=micro_batch_idx, **recv_kwargs)
 
     return send_future, recv_future, next_tokens
 
@@ -277,6 +281,7 @@ def decode(
     all_tokens = [[None for _ in range(len(token_idxs))] for _ in range(num_micro_batches)]
     for i, token_idx in enumerate(token_idxs):
         start_decode_step = perf_counter()
+        logger.debug(f"Starting decode step {i + 1} for {token_idx=}")
         input_pos = torch.tensor([token_idx], device=device, dtype=torch.long)
         mask = adjust_mask(block_mask, input_pos, model.max_seq_length)
         for micro_batch_idx in range(num_micro_batches):
@@ -296,7 +301,7 @@ def decode(
                 continue
             all_tokens[micro_batch_idx][i - 1] = micro_batch_tokens
         torch.cuda.synchronize()
-        logger.debug(f"Decode {token_idx=} took {(perf_counter() - start_decode_step) * 1000:.02f}ms")
+        logger.debug(f"Decode step {i + 1} for {token_idx=} took {(perf_counter() - start_decode_step) * 1000:.02f}ms")
         if pbar is not None:
             pbar.update(1)
 

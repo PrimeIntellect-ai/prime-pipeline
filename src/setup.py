@@ -97,6 +97,15 @@ def setup(
             max_seq_length=num_cache_tokens,
         )
 
+    # Compile model
+    logger.info("Compiling model...")
+    if compile:
+        full_compile()
+
+    t0 = perf_counter()
+    fake_generate(model, num_prompt_tokens, num_micro_batches, micro_batch_size)
+    logger.info(f"Model compiled in {perf_counter() - t0:.02f} seconds")
+
     # Setup communication
     logger.info(f"Setting up communication backend {backend}...")
     setup_comm(
@@ -107,14 +116,5 @@ def setup(
         latency=latency,
         num_micro_batches=num_micro_batches,
     )
-
-    # Compile model
-    logger.info("Compiling model...")
-    if compile:
-        full_compile()
-
-    t0 = perf_counter()
-    fake_generate(model, num_prompt_tokens, num_micro_batches, micro_batch_size)
-    logger.info(f"Model compiled in {perf_counter() - t0:.02f} seconds")
 
     return model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size
