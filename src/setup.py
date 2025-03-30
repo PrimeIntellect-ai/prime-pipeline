@@ -99,12 +99,12 @@ def setup(
 
     # Compile model
     logger.info("Compiling model...")
+    start_compile = perf_counter()
     if compile:
         full_compile()
-
-    t0 = perf_counter()
     fake_generate(model, num_prompt_tokens, num_micro_batches, micro_batch_size)
-    logger.info(f"Model compiled in {perf_counter() - t0:.02f} seconds")
+    compile_time = perf_counter() - start_compile
+    logger.info(f"Model compiled in {compile_time:.02f} seconds")
 
     # Setup communication
     logger.info(f"Setting up communication backend {backend}...")
@@ -117,4 +117,4 @@ def setup(
         num_micro_batches=num_micro_batches,
     )
 
-    return model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size
+    return model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size, compile_time

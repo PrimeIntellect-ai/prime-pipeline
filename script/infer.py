@@ -19,7 +19,7 @@ monkey_patch()
 
 def main(args: argparse.Namespace) -> None:
     # Setup
-    model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size = setup(
+    model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size, _ = setup(
         rank=int(os.environ.get("RANK", 0)),
         local_rank=to_int_or_none(os.environ.get("LOCAL_RANK")),
         world_size=int(os.environ.get("WORLD_SIZE", 1)),
@@ -116,7 +116,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="torch",
+        default="iroh",
         help="Either `torch` or `iroh`.",
     )
     parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
