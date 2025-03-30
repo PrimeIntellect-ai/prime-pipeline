@@ -298,14 +298,17 @@ class Transformer(nn.Module):
         micro_batch_idx: int,
         mask: BlockMask,
         input_pos: Tensor,
-        input_ids: Optional[Tensor],
-        hidden_states: Optional[Tensor] = None,
+        input_ids_or_hidden_states: Optional[Tensor],
     ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
         freqs_cis = self.freqs_cis[input_pos]
 
-        assert hidden_states is not None or input_ids is not None, "Must provide either hidden states or input ids"
+        input_ids, hidden_states = None, None
+        if input_ids_or_hidden_states.size(-1) > 1:
+            hidden_states = input_ids_or_hidden_states
+        else:
+            input_ids = input_ids_or_hidden_states
         x = hidden_states if hidden_states is not None else input_ids
 
         x = self.tok_embeddings(x)

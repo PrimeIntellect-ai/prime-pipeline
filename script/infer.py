@@ -19,7 +19,7 @@ monkey_patch()
 
 def main(args: argparse.Namespace) -> None:
     # Setup
-    model, tokenizer, decoded_tokens, num_prompt_tokens, micro_batch_size = setup(
+    model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size = setup(
         rank=int(os.environ.get("RANK", 0)),
         local_rank=to_int_or_none(os.environ.get("LOCAL_RANK")),
         world_size=int(os.environ.get("WORLD_SIZE", 1)),
@@ -43,35 +43,29 @@ def main(args: argparse.Namespace) -> None:
 
     # Generate
     torch.cuda.synchronize()
-    t0 = perf_counter()
-    decoded_tokens, _, _ = generate(
+    start_generate = perf_counter()
+    decoded_tokens, prefill_time, decode_time = generate(
         model=model,
-        decoded_tokens=decoded_tokens,
+        prompt_tokens=prompt_tokens,
         num_prompt_tokens=num_prompt_tokens,
+        num_new_tokens=args.num_new_tokens,
+        num_micro_batches=args.num_micro_batches,
         micro_batch_size=micro_batch_size,
-        use_tqdm=args.use_tqdm,
+        disable_tqdm=args.disable_tqdm,
         temperature=args.temperature,
         top_k=args.top_k,
     )
-    time_taken = perf_counter() - t0
-    logger.info(f"Time taken: {time_taken:.02f}s")
-    logger.info(f"Tokens generated: {args.batch_size * args.num_new_tokens}")
-    logger.info(f"Tokens per second: {(args.batch_size * args.num_new_tokens) / time_taken:.02f}")
 
+    # Print generations
     if world.is_master:
         for batch_idx, generation in enumerate(decoded_tokens):
             logger.info(f"Generation {batch_idx + 1}: {tokenizer.decode(generation.tolist(), skip_special_tokens=True)}")
 
-    # num_discard_tokens = 5
-    # decode_times = discard_initial_tokens(decode_metrics["times"], num_discard_tokens)
-    # forward_times = discard_initial_tokens(decode_metrics["forward_times"], num_discard_tokens)
-    # wait_times = discard_initial_tokens(decode_metrics["wait_times"], num_discard_tokens)
-    # logger.info(
-    #     f"Decode throughput: {(len(decode_times) * args.batch_size) / sum(flatten_list(decode_times)):.02f} tokens/second (avg. of last {len(decode_times)} generations)"
-    # )
-    # logger.info(f"Mean decode time: {(mean(flatten_list(decode_times)) * 1000):.02f}ms ")
-    # logger.info(f"Mean decode forward time: {(mean(flatten_list(forward_times)) * 1000):.02f}ms ")
-    # logger.info(f"Mean decode wait time: {(mean(flatten_list(wait_times)) * 1000):.02f}ms ")
+    # Print metrics
+    generate_time = perf_counter() - start_generate
+    logger.info(f"Time: {generate_time:.02f}s (Prefill: {prefill_time:.02f}s, Decode: {decode_time:.02f}s)")
+    logger.info(f"Generated Tokens: {args.batch_size * args.num_new_tokens}")
+    logger.info(f"Throughput: {(args.batch_size * args.num_new_tokens) / generate_time:.02f} T/s")
 
     # Destroy communication
     comm.destroy()
@@ -126,7 +120,7 @@ if __name__ == "__main__":
         help="Either `torch` or `iroh`.",
     )
     parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
-    parser.add_argument("--use-tqdm", action="store_true", help="Use tqdm for progress bar.")
+    parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm for progress bar.")
     args = parser.parse_args()
 
     main(args)

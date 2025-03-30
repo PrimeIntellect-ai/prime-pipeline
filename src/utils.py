@@ -23,13 +23,26 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def get_device(device: str, world: World) -> torch.device:
-    if device == "cuda":
-        return torch.device(f"cuda:{world.local_rank}")
-    elif device == "cpu":
-        return torch.device("cpu")
-    else:
-        raise NotImplementedError(f"Device {device} not implemented")
+_DEVICE = None
+
+
+def setup_device(device: str, world: World) -> torch.device:
+    global _DEVICE
+    if _DEVICE is None:
+        if device == "cuda":
+            _DEVICE = torch.device(f"cuda:{world.local_rank}")
+        elif device == "cpu":
+            _DEVICE = torch.device("cpu")
+        else:
+            raise NotImplementedError(f"Device {device} not implemented")
+    return _DEVICE
+
+
+def get_device() -> torch.device:
+    global _DEVICE
+    if _DEVICE is None:
+        raise ValueError("Device not set")
+    return _DEVICE
 
 
 def get_precision(precision: str) -> torch.dtype:

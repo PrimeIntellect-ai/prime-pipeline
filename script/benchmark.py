@@ -7,7 +7,6 @@ from itertools import product
 from multiprocessing import Process, Queue
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, Literal
 
 import autorootcwd  # noqa: F401
 import torch
@@ -16,7 +15,7 @@ from tabulate import tabulate
 
 from src.generate import generate
 from src.setup import setup
-from src.utils import flatten_list, mean
+from src.utils import mean
 
 # Use lovely tensors
 monkey_patch()
@@ -28,21 +27,6 @@ IROH_PAIRS = {
     2: "191fc38f134aaf1b7fdb1f86330b9d03e94bd4ba884f490389de964448e89b3f",
     3: "c5bbbb60e412879bbec7bb769804fa8e36e68af10d5477280b63deeaca931bed",
 }
-
-
-# Compute decode metrics for this iteration
-def compute_metrics(metrics: Dict, warmup: bool, stage: Literal["prefill", "decode"]) -> Dict:
-    total_time = sum(flatten_list(metrics["times"][int(warmup) :]))
-    mean_forward_time = mean(flatten_list(metrics["forward_times"][int(warmup) :]))
-    mean_wait_time = mean(flatten_list(metrics["wait_times"][int(warmup) :]))
-    tps = (metrics["num_new_tokens"] - int(warmup)) / total_time
-    return {
-        f"{stage}_time": total_time,
-        f"{stage}_tps": tps,
-        f"{stage}_forward_time": mean_forward_time,
-        f"{stage}_wait_time": mean_wait_time,
-        f"{stage}_num_new_tokens": metrics["num_new_tokens"],
-    }
 
 
 def run_benchmark(
@@ -104,17 +88,19 @@ def run_benchmark(
     metrics = []
     for sample_idx in range(num_iterations):
         torch.cuda.synchronize()
-        _, prefill_metrics, decode_metrics = generate(
+        start_generate = perf_counter()
+        _, prefill_time, decode_time = generate(
             model=model,
             decoded_tokens=decoded_tokens,
             num_prompt_tokens=num_prompt_tokens,
             micro_batch_size=micro_batch_size,
             use_tqdm=True,
         )
+        generate_time = perf_counter() - start_generate
 
         # Compute metrics
-        computed_prefill_metrics = compute_metrics(prefill_metrics, warmup=False, stage="prefill")
-        computed_decode_metrics = compute_metrics(decode_metrics, warmup=warmup, stage="decode")
+        generated_tokens = batch_size * num_new_tokens
+        throughput = generated_tokens / generate_time
 
         metrics.append(
             {
@@ -122,10 +108,10 @@ def run_benchmark(
                 "iteration": sample_idx + 1,
                 "setup_time": setup_time["setup_time"],
                 "compile_time": setup_time["compile_time"],
-                "prefill_metrics": prefill_metrics,
-                "decode_metrics": decode_metrics,
-                **computed_prefill_metrics,
-                **computed_decode_metrics,
+                "generated_tokens": generated_tokens,
+                "throughput": throughput,
+                "prefill_time": prefill_time,
+                "decode_time": decode_time,
             }
         )
 
