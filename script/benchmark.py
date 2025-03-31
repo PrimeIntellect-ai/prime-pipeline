@@ -26,6 +26,10 @@ IROH_PAIRS = {
     1: "ff87a0b0a3c7c0ce827e9cada5ff79e75a44a0633bfcb5b50f99307ddb26b337",
     2: "191fc38f134aaf1b7fdb1f86330b9d03e94bd4ba884f490389de964448e89b3f",
     3: "c5bbbb60e412879bbec7bb769804fa8e36e68af10d5477280b63deeaca931bed",
+    4: "4f44e6c7bdfed3d9f48d86149ee3d29382cae8c83ca253e06a70be54a301828b",
+    5: "e2e8aa145e1ec5cb01ebfaa40e10e12f0230c832fd8135470c001cb86d77de00",
+    6: "17888c2ca502371245e5e35d5bcf35246c3bc36878e859938c9ead3c54db174f",
+    7: "478243aed376da313d7cf3a60637c264cb36acc936efb341ff8d3d712092d244",
 }
 
 
@@ -58,8 +62,8 @@ def run_benchmark(
         assert world_size <= len(IROH_PAIRS), (
             f"World size {world_size} is greater than the configured number of known nodes {len(IROH_PAIRS)}"
         )
-        os.environ["RANK"], os.environ["LOCAL_RANK"], os.environ["WORLD_SIZE"] = str(rank), str(local_rank), str(world_size)
-        os.environ["CACHE_DIR"] = os.environ.get("CACHE_DIR", "/ephemeral")
+        os.environ["RANK"], os.environ["LOCAL_RANK"], os.environ["WORLD_SIZE"] = str(rank), str(4 + rank), str(world_size)
+        os.environ["CACHE_DIR"] = os.environ.get("CACHE_DIR", "/workspace")
         if backend == "iroh":
             os.environ["IROH_SEED"] = str(rank)
             os.environ["IROH_PEER_ID"] = IROH_PAIRS[(rank + 1) % world_size]
