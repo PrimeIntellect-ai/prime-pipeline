@@ -11,7 +11,6 @@ log_info() {
 }
 
 main() {
-
     log_info "Cloning repository..."
     git clone https://github.com/primeintellect-ai/pipelined-gpt-fast.git
     
@@ -20,6 +19,9 @@ main() {
     
     log_info "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    log_info "Installing rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
     
     log_info "Sourcing uv environment..."
     if ! command -v uv &> /dev/null; then
@@ -35,7 +37,7 @@ main() {
     log_info "Installing dependencies..."
     uv sync
         
-    log_info "Installation completed! You can double check that everything is install correctly by running 'RANK=0 WORLD_SIZE=1 uv run python src/generate.py'"
+    log_info "Installation completed! You can now run inference. Check out the README for more information."
 }
 
 main
