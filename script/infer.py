@@ -19,7 +19,7 @@ monkey_patch()
 
 def main(args: argparse.Namespace) -> None:
     # Setup
-    model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size, _ = setup(
+    model, tokenizer, prompt_tokens, num_prompt_tokens, batch_size, micro_batch_size, _ = setup(
         rank=int(os.environ.get("RANK", 0)),
         local_rank=to_int_or_none(os.environ.get("LOCAL_RANK")),
         world_size=int(os.environ.get("WORLD_SIZE", 1)),
@@ -31,11 +31,13 @@ def main(args: argparse.Namespace) -> None:
         dummy=args.dummy,
         prompt=args.prompt,
         backend=args.backend,
+        batch_size=args.batch_size,
+        micro_batch_size=args.micro_batch_size,
         num_micro_batches=args.num_micro_batches,
         num_new_tokens=args.num_new_tokens,
         num_cache_tokens=args.num_cache_tokens,
-        batch_size=args.batch_size,
         compile=args.compile,
+        latency=args.latency,
     )
 
     # Get world, logger and comm
@@ -64,8 +66,8 @@ def main(args: argparse.Namespace) -> None:
     # Print metrics
     generate_time = perf_counter() - start_generate
     logger.info(f"Time: {generate_time:.02f}s (Prefill: {prefill_time:.02f}s, Decode: {decode_time:.02f}s)")
-    logger.info(f"Generated Tokens: {args.batch_size * args.num_new_tokens}")
-    logger.info(f"Throughput: {(args.batch_size * args.num_new_tokens) / generate_time:.02f} T/s")
+    logger.info(f"Generated Tokens: {batch_size * args.num_new_tokens}")
+    logger.info(f"Throughput: {(batch_size * args.num_new_tokens) / generate_time:.02f} T/s")
 
     # Destroy communication
     comm.destroy()
@@ -82,43 +84,20 @@ if __name__ == "__main__":
         help="Model name.",
     )
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Input prompt.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size.")
-    parser.add_argument(
-        "--num-micro-batches",
-        type=int,
-        default=1,
-        help="Number of micro-batches.",
-    )
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size.")
+    parser.add_argument("--micro-batch-size", type=int, default=None, help="Micro-batch size.")
+    parser.add_argument("--num-micro-batches", type=int, default=1, help="Number of micro-batches.")
     parser.add_argument("--num-cache-tokens", type=int, default=0, help="Number of cache tokens.")
-    parser.add_argument(
-        "--num-new-tokens",
-        type=int,
-        default=50,
-        help="Number of new tokens to generate.",
-    )
+    parser.add_argument("--num-new-tokens", type=int, default=256, help="Number of new tokens to generate.")
     parser.add_argument("--top-k", type=int, default=200, help="Top-k for sampling.")
     parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for sampling.")
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        default=False,
-        help="Whether to compile the model.",
-    )
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use for the model.")
-    parser.add_argument(
-        "--precision",
-        type=str,
-        default="bfloat16",
-        help="Precision to use for the model.",
-    )
+    parser.add_argument("--compile", action="store_true", default=False, help="Whether to compile the model.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use for the full model.")
+    parser.add_argument("--precision", type=str, default="bfloat16", help="Precision to use for the model.")
     parser.add_argument("--seed", type=int, default=1234, help="Seed for reproducibility.")
     parser.add_argument("--log-level", type=str, default="INFO", help="Log level.")
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default="iroh",
-        help="Either `torch` or `iroh`.",
-    )
+    parser.add_argument("--latency", type=int, default=None, help="Latency to use for the model.")
+    parser.add_argument("--backend", type=str, default="iroh", help="Either `torch` or `iroh`.")
     parser.add_argument("--dummy", action="store_true", help="Use dummy weights.")
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm for progress bar.")
     args = parser.parse_args()

@@ -25,10 +25,11 @@ def setup(
     dummy: bool,
     prompt: str,
     backend: str,
+    batch_size: Optional[int],
+    micro_batch_size: Optional[int],
     num_micro_batches: int,
     num_new_tokens: int,
     num_cache_tokens: int,
-    batch_size: int,
     compile: bool,
     latency: Optional[int] = None,  # Only set for benchmark
 ) -> Tuple:
@@ -73,7 +74,15 @@ def setup(
     logger.info("Encoding prompt...")
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(device)
     num_prompt_tokens = prompt_tokens.size(-1)
-    micro_batch_size = batch_size // num_micro_batches
+    
+    assert (batch_size is not None) ^ (micro_batch_size is not None), "Either batch_size or micro_batch_size must be provided, but not both"
+    if batch_size is not None:
+        logger.info(f"Auto-detecting micro batch size from global batch size {batch_size}...")
+        micro_batch_size = batch_size // num_micro_batches
+    else:
+        logger.info(f"Auto-detecting global batch size from micro batch size {micro_batch_size}...")
+        batch_size = num_micro_batches * micro_batch_size
+    logger.info(f"Setting {batch_size=}, {micro_batch_size=}, {num_micro_batches=}")
     prompt_tokens = list(prompt_tokens.repeat(batch_size, 1).split(micro_batch_size))
 
     # Setup model cache
@@ -117,4 +126,4 @@ def setup(
         num_micro_batches=num_micro_batches,
     )
 
-    return model, tokenizer, prompt_tokens, num_prompt_tokens, micro_batch_size, compile_time
+    return model, tokenizer, prompt_tokens, num_prompt_tokens, batch_size, micro_batch_size, compile_time

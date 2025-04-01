@@ -45,6 +45,7 @@ def run_benchmark(
     num_new_tokens: int,
     num_cache_tokens: int,
     batch_size: int,
+    micro_batch_size: int,
     num_micro_batches: int,
     device: str,
     precision: str,
@@ -70,7 +71,7 @@ def run_benchmark(
 
         # Setup world, logger, comm and load model
         start_setup = perf_counter()
-        model, _, prompt_tokens, num_prompt_tokens, micro_batch_size, compile_time = setup(
+        model, _, prompt_tokens, num_prompt_tokens, batch_size, micro_batch_size, compile_time = setup(
             rank=rank,
             local_rank=local_rank,
             world_size=world_size,
@@ -82,10 +83,11 @@ def run_benchmark(
             dummy=dummy,
             prompt=prompt,
             backend=backend,
+            batch_size=batch_size,
+            micro_batch_size=micro_batch_size,
             num_micro_batches=num_micro_batches,
             num_new_tokens=num_new_tokens,
             num_cache_tokens=num_cache_tokens,
-            batch_size=batch_size,
             compile=compile,
             latency=latency,
         )
@@ -156,7 +158,7 @@ def main(args: argparse.Namespace) -> None:
         print(f"Running configuration {config_idx} with {dynamic_config}")
 
         # Skip if batch size is less than number of micro batches
-        if dynamic_config["batch_size"] < dynamic_config["num_micro_batches"]:
+        if dynamic_config.get("batch_size") is not None and dynamic_config["batch_size"] < dynamic_config["num_micro_batches"]:
             print("Skipping because batch_size < num_micro_batches")
             continue
 
@@ -233,7 +235,8 @@ if __name__ == "__main__":
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm progress bar.")
 
     # Dynamic arguments
-    parser.add_argument("--batch-size", type=int, nargs="+", default=[1], help="Batch size.")
+    parser.add_argument("--batch-size", type=int, nargs="+", help="Batch size.")
+    parser.add_argument("--micro-batch-size", type=int, nargs="+", help="Micro batch size.")
     parser.add_argument(
         "--num-micro-batches",
         type=int,
