@@ -9,6 +9,9 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import BlockMask, _mask_mod_signature, flex_attention
 
+from .cache import KVCache, StaticKVCache
+from .logger import get_logger
+
 MODEL_REGISTRY = {
     "meta-llama/llama-2-7b-chat-hf": dict(n_layer=32, n_head=32, dim=4096),
     "meta-llama/meta-llama-3-8b": dict(
@@ -199,40 +202,6 @@ def modded_flex_attention(
     )
 
 
-class KVCache(nn.Module):
-    def __init__(
-        self,
-        num_micro_batches,
-        max_micro_batch_size,
-        max_seq_length,
-        n_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-    ):
-        super().__init__()
-        cache_shape = (
-            num_micro_batches,
-            max_micro_batch_size,
-            n_heads,
-            max_seq_length,
-            head_dim,
-        )
-        self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
-
-    def update(self, micro_batch_idx, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
-
-        k_out = self.k_cache
-        v_out = self.v_cache
-
-        k_out[micro_batch_idx, :, :, input_pos, :] = k_val.unsqueeze(0)
-        v_out[micro_batch_idx, :, :, input_pos, :] = v_val.unsqueeze(0)
-
-        return k_out[micro_batch_idx], v_out[micro_batch_idx]
-
-
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
@@ -275,15 +244,15 @@ class Transformer(nn.Module):
             dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
-        for b in self.layers:
-            b.attention.kv_cache = KVCache(
-                num_micro_batches,
-                max_micro_batch_size,
-                max_seq_length,
-                self.config.n_local_heads,
-                head_dim,
-                dtype,
-            )
+        self.kv_cache = StaticKVCache(
+            num_layers=self.config.n_layer,
+            num_micro_batches=num_micro_batches,
+            max_micro_batch_size=max_micro_batch_size,
+            max_seq_length=max_seq_length,
+            n_heads=self.config.n_local_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
 
         self.freqs_cis = precompute_freqs_cis(
             self.config.block_size,
@@ -313,8 +282,8 @@ class Transformer(nn.Module):
 
         x = self.tok_embeddings(x)
 
-        for layer in self.layers:
-            x = layer(micro_batch_idx, x, input_pos, freqs_cis, mask)
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(layer_idx, micro_batch_idx, x, input_pos, freqs_cis, mask, self.kv_cache)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -325,7 +294,6 @@ class Transformer(nn.Module):
 
         from huggingface_hub import snapshot_download
 
-        from .logger import get_logger
         from .utils import convert_model
 
         logger = get_logger()
@@ -370,13 +338,15 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
+        layer_idx: int,
         micro_batch_idx: int,
         x: Tensor,
         input_pos: Tensor,
         freqs_cis: Tensor,
         mask: BlockMask,
+        kv_cache: KVCache,
     ) -> Tensor:
-        h = x + self.attention(micro_batch_idx, self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = x + self.attention(layer_idx, micro_batch_idx, self.attention_norm(x), freqs_cis, mask, input_pos, kv_cache)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -390,7 +360,6 @@ class Attention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
         self.wo = nn.Linear(config.dim, config.dim, bias=False)
-        self.kv_cache = None
 
         self.n_head = config.n_head
         self.head_dim = config.head_dim
@@ -407,11 +376,13 @@ class Attention(nn.Module):
 
     def forward(
         self,
+        layer_idx: int,
         micro_batch_idx: int,
         x: Tensor,
         freqs_cis: Tensor,
         mask: BlockMask,
         input_pos: Optional[Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -427,8 +398,7 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        if self.kv_cache is not None:
-            k, v = self.kv_cache.update(micro_batch_idx, input_pos, k, v)
+        k, v = kv_cache.update(layer_idx, micro_batch_idx, input_pos, k, v)
 
         y = modded_flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
 
