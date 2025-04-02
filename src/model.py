@@ -9,7 +9,7 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import BlockMask, _mask_mod_signature, flex_attention
 
-from .cache import KVCache, StaticKVCache
+from .cache import StaticKVCache, StaticOffloadedKVCache
 from .logger import get_logger
 
 MODEL_REGISTRY = {
@@ -244,11 +244,11 @@ class Transformer(nn.Module):
             dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
-        self.kv_cache = StaticKVCache(
+        self.kv_cache = StaticOffloadedKVCache(
             num_layers=self.config.n_layer,
             num_micro_batches=num_micro_batches,
-            max_micro_batch_size=max_micro_batch_size,
-            max_seq_length=max_seq_length,
+            micro_batch_size=max_micro_batch_size,
+            seq_length=max_seq_length,
             n_heads=self.config.n_local_heads,
             head_dim=head_dim,
             dtype=dtype,
@@ -344,7 +344,7 @@ class TransformerBlock(nn.Module):
         input_pos: Tensor,
         freqs_cis: Tensor,
         mask: BlockMask,
-        kv_cache: KVCache,
+        kv_cache: Union[StaticKVCache, StaticOffloadedKVCache],
     ) -> Tensor:
         h = x + self.attention(layer_idx, micro_batch_idx, self.attention_norm(x), freqs_cis, mask, input_pos, kv_cache)
         out = h + self.feed_forward(self.ffn_norm(h))
@@ -381,8 +381,8 @@ class Attention(nn.Module):
         x: Tensor,
         freqs_cis: Tensor,
         mask: BlockMask,
-        input_pos: Optional[Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
+        input_pos: Optional[Tensor],
+        kv_cache: Union[StaticKVCache, StaticOffloadedKVCache],
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 

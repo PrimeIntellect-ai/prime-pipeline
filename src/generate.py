@@ -19,6 +19,7 @@ from .world import get_world
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True
+torch._dynamo.config.cache_size_limit = 64
 
 
 def multinomial_sample_one_no_sync(probs_sort: Tensor) -> Tensor:
