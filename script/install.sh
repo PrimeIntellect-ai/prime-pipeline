@@ -12,7 +12,7 @@ log_info() {
 
 main() {
     log_info "Cloning repository..."
-    git clone https://github.com/primeintellect-ai/pipelined-gpt-fast.git
+    git clone git@github.com:PrimeIntellect-ai/pipelined-gpt-fast.git
     
     log_info "Entering project directory..."
     cd pipelined-gpt-fast
@@ -21,7 +21,7 @@ main() {
     curl -LsSf https://astral.sh/uv/install.sh | sh
 
     log_info "Installing rust..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     
     log_info "Sourcing uv environment..."
     if ! command -v uv &> /dev/null; then
