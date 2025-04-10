@@ -8,19 +8,16 @@
 <p align="center">
 
 <h3 align="center">
-[WIP]: Pipelined Inference over the Internet
+[Experimental]: Decentralized Pipelined Inference
 </h3>
-<p align="center">
-| <a href=""><b>Blog</b></a> | <a href=""><b>X Thread</b></a> |
-</p>
 
 ---
 
-This is a library for pipelined inference over the Internet. The repository is still under active development.
+This is a open-source research repository designed for quickly validating research ideas for pipelined inference over public networks. The codebase initially built upon [GPT-Fast](https://github.com/pytorch-labs/gpt-fast), but has since diverged. Most notably, the codebase implements synchronous and asynchronous communication protocols for pipeline parallel inference.
 
-The library has two main entrypoints: 
-- `src/infer.py` is used to generate text using a given model and generation parameters.
-- `src/benchmark.py` is used to benchmark the inference performance in various configurations.
+The codebase has two main entrypoints: 
+- `script/infer.py` is used to generate text given model and generation parameters.
+- `script/benchmark.py` is used to benchmark performance in varying (artificial) network conditions.
 
 
 # Usage
@@ -68,23 +65,31 @@ To check that your installation has succeeded, you can run the following command
 RANK=0 WORLD_SIZE=1 uv run python script/infer.py
 ```
 
-Run `uv run python src/infer.py --help` for more information on the available options.
+Run `uv run python script/infer.py --help` for more information on the available options.
 
 
-If you want to run distributed inference, adjust your environment variables to your setup. For example, if you have two nodes, you can run the following command:
+Running distributed inference is as easy as adjusting the environment variables to your setup. For peer-to-peer communication using `iroh`, it's easiest for testing to set seed the public key generation required for connecting the nodes. For example, if you have two nodes, you can run the following command:
 
 ```bash
-RANK=0 WORLD_SIZE=2 uv run python script/infer.py # On the first node
-RANK=1 WORLD_SIZE=2 uv run python script/infer.py # On the second node
+# On the first node
+export IROH_SEED=0
+export IROH_PEER_ID=ff87a0b0a3c7c0ce827e9cada5ff79e75a44a0633bfcb5b50f99307ddb26b337
+RANK=0 WORLD_SIZE=2 uv run python script/infer.py
 ```
 
+```bash
+# On the second node
+export IROH_SEED=1
+export IROH_PEER_ID=ee1aa49a4459dfe813a3cf6eb882041230c7b2558469de81f87c9bf23bf10a03
+RANK=1 WORLD_SIZE=2 uv run python script/infer.py
+```
 
 ## Benchmark
 
-To benchmark the inference performance, you can use the `src/benchmark.py` script. It will generate a given number of new tokens from a given prompt and time various aspects of the inference, like startup, prefill, and decode time. Some of the parameters are static, others are dynamic and can be specified as a list. The benchmark will automatically run all combinations of the dynamic parameters and save the benchmark results in the `benchmark` directory under the model name. Repeated benchmark runs will append to the existing results. The benchmark script will not run over the network, but on colocated nodes and simulate network latency (only for the `iroh` backend).
+To benchmark the inference performance, you can use the `script/benchmark.py` script. It will generate a given number of new tokens from a given prompt and times various aspects of the inference, like startup, prefill, and decode time. Some of the parameters are static, others are dynamic and can be specified as a list. The benchmark will automatically run all combinations of the dynamic parameters and save the benchmark results in the `benchmark` directory under the model name. Repeated benchmark runs will append to the existing results. The benchmark script will not run over the network, but on colocated nodes and simulate network latency (only for the `iroh` backend).
 
 ```bash
 uv run python script/benchmark.py
 ```
 
-Run `uv run python src/benchmark.py --help` for more information on the available options.
+Run `uv run python script/benchmark.py --help` for more information on the available options.

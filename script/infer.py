@@ -84,7 +84,7 @@ if __name__ == "__main__":
         help="Model name.",
     )
     parser.add_argument("--prompt", type=str, default="Hello, my name is", help="Input prompt.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size.")
     parser.add_argument("--micro-batch-size", type=int, default=None, help="Micro-batch size.")
     parser.add_argument("--num-micro-batches", type=int, default=1, help="Number of micro-batches.")
     parser.add_argument("--num-cache-tokens", type=int, default=0, help="Number of cache tokens.")
