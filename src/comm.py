@@ -3,53 +3,17 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
 from threading import Thread
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import torch.distributed as dist
-from iroh_py import Node, RecvWork, SendWork
+from iroh_py import Node
 
 from .logger import get_logger
 from .offload import Offload
 from .serializer import Serializer
 from .utils import fake_future
 from .world import get_world
-
-
-class WorkBase(ABC):
-    def __init__(
-        self,
-        tensor: Optional[torch.Tensor],
-        work: Union[SendWork, RecvWork, dist.Work],
-        device: torch.device,
-        serializer: Optional[Serializer] = None,
-        offload: Optional[Offload] = None,
-    ):
-        self.tensor = tensor
-        self.work = work
-        self.device = device
-        self.serializer = serializer
-        self.offload = offload
-
-    def deserialize(self, tensor: Union[bytes, torch.Tensor]) -> torch.Tensor:
-        """Deserializes a tensor if a serializer is provided"""
-        if self.serializer:
-            return self.serializer.deserialize(tensor)
-        return tensor
-
-    def move_to_device(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Moves a tensor to the correct device"""
-        if isinstance(tensor, torch.Tensor):
-            t0 = time.perf_counter()
-            tensor = tensor.to(self.device)
-            get_logger().debug(f"Move to device took {(time.perf_counter() - t0) * 1000:.02f}ms")
-            return tensor
-        return tensor
-
-    @abstractmethod
-    def wait(self) -> Optional[torch.Tensor]:
-        """Waits for the work to complete and returns the result"""
-
 
 class P2PCommBase(ABC):
     def __init__(self, device: torch.device, serializer: Optional[Serializer] = None, offload: Optional[Offload] = None):
@@ -63,11 +27,11 @@ class P2PCommBase(ABC):
         pass
 
     @abstractmethod
-    def isend(self, data: torch.Tensor, tag: int) -> WorkBase:
+    def isend(self, data: torch.Tensor, tag: int):
         pass
 
     @abstractmethod
-    def irecv(self, tag: int, shape: tuple[int, ...]) -> WorkBase:
+    def irecv(self, tag: int, shape: tuple[int, ...]):
         pass
 
     @abstractmethod
@@ -212,6 +176,7 @@ class IrohP2PComm(P2PCommBase):
         super().__init__(device, serializer, offload, **kwargs)
         self.logger = get_logger()
         self.num_micro_batches, self.latency = num_micro_batches, latency
+        self.node = None
         if self.world.size <= 1:
             return
         self._setup()
@@ -274,4 +239,5 @@ class IrohP2PComm(P2PCommBase):
         return RecvTask(self.serializer, self.offload, recv_work)
 
     def destroy(self):
-        pass  # TODO: Fix
+        if self.node is not None:
+            self.node.close()
