@@ -235,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm progress bar.")
 
     # Dynamic arguments
-    parser.add_argument("--batch-size", type=int, nargs="+", help="Batch size.")
+    parser.add_argument("--batch-size", type=int, nargs="+", default=[1], help="Batch size.")
     parser.add_argument("--micro-batch-size", type=int, nargs="+", help="Micro batch size.")
     parser.add_argument(
         "--num-micro-batches",
