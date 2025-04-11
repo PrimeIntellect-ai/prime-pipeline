@@ -16,7 +16,7 @@
 This is a open-source research repository designed for quickly validating research ideas for pipelined inference over public networks. The codebase initially built upon [GPT-Fast](https://github.com/pytorch-labs/gpt-fast), but has since diverged. Most notably, the codebase implements synchronous and asynchronous communication protocols for pipeline parallel inference.
 
 The codebase has two main entrypoints: 
-- `script/infer.py` is used to generate text given model and generation parameters.
+- `script/generate.py` is used to generate text given model and generation parameters.
 - `script/benchmark.py` is used to benchmark performance in varying (artificial) network conditions.
 
 
@@ -62,10 +62,10 @@ export HF_TOKEN=<your-token>
 To check that your installation has succeeded, you can run the following command to generate text with a small model on a single node:
 
 ```bash
-RANK=0 WORLD_SIZE=1 uv run python script/infer.py
+RANK=0 WORLD_SIZE=1 uv run python script/generate.py
 ```
 
-Run `uv run python script/infer.py --help` for more information on the available options.
+Run `uv run python script/generate.py --help` for more information on the available options.
 
 
 Running distributed inference is as easy as adjusting the environment variables to your setup. For peer-to-peer communication using `iroh`, it's easiest for testing to set seed the public key generation required for connecting the nodes. For example, if you have two nodes, you can run the following command:
@@ -74,14 +74,14 @@ Running distributed inference is as easy as adjusting the environment variables 
 # On the first node
 export IROH_SEED=0
 export IROH_PEER_ID=ff87a0b0a3c7c0ce827e9cada5ff79e75a44a0633bfcb5b50f99307ddb26b337
-RANK=0 WORLD_SIZE=2 uv run python script/infer.py
+RANK=0 WORLD_SIZE=2 uv run python script/generate.py
 ```
 
 ```bash
 # On the second node
 export IROH_SEED=1
 export IROH_PEER_ID=ee1aa49a4459dfe813a3cf6eb882041230c7b2558469de81f87c9bf23bf10a03
-RANK=1 WORLD_SIZE=2 uv run python script/infer.py
+RANK=1 WORLD_SIZE=2 uv run python script/generate.py
 ```
 
 ## Benchmark
