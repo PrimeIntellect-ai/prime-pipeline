@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from iroh_py import Node
+from prime_iroh import Node
 
 from .logger import get_logger
 from .offload import Offload

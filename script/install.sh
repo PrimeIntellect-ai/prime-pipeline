@@ -12,10 +12,10 @@ log_info() {
 
 main() {
     log_info "Cloning repository..."
-    git clone git@github.com:PrimeIntellect-ai/pipelined-gpt-fast.git
+    git clone https://github.com/PrimeIntellect-ai/prime-pipeline.git
     
     log_info "Entering project directory..."
-    cd pipelined-gpt-fast
+    cd prime-pipeline
     
     log_info "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh

@@ -8,7 +8,7 @@
 <p align="center">
 
 <h3 align="center">
-[Experimental]: Decentralized Pipelined Inference
+PRIME-PIPELINE: Research Sandbox for Decentralized Pipelined Inference
 </h3>
 
 ---
@@ -28,7 +28,7 @@ The codebase has two main entrypoints:
 
 
 ```
-curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/pipelined-gpt-fast/refs/heads/main/script/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-pipeline/refs/heads/master/script/install.sh | bash
 ```
 
 **Manual Install:** First, install `uv` and `cargo` to build the project.
@@ -46,7 +46,7 @@ source $HOME/.cargo/env
 Then, clone the repository and install the dependencies.
 
 ```bash
-git clone git@github.com:PrimeIntellect-ai/pipelined-gpt-fast.git && cd pipelined-gpt-fast
+git clone https://github.com/PrimeIntellect-ai/prime-pipeline.git && cd prime-pipeline
 uv sync
 ```
 
