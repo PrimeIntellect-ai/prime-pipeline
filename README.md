@@ -28,7 +28,7 @@ The codebase has two main entrypoints:
 
 
 ```
-curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-pipeline/refs/heads/master/script/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-pipeline/refs/heads/main/script/install.sh | bash
 ```
 
 **Manual Install:** First, install `uv` and `cargo` to build the project.
