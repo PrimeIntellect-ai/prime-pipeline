@@ -31,16 +31,11 @@ The codebase has two main entrypoints:
 curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-pipeline/refs/heads/main/script/install.sh | bash
 ```
 
-**Manual Install:** First, install `uv` and `cargo` to build the project.
+**Manual Install:** First, install `uv` to build the project.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
-```
-
-```bash
-curl https://sh.rustup.rs -sSf | sh
-source $HOME/.cargo/env
 ```
 
 Then, clone the repository and install the dependencies.
@@ -68,21 +63,31 @@ RANK=0 WORLD_SIZE=1 uv run python script/generate.py
 Run `uv run python script/generate.py --help` for more information on the available options.
 
 
-Running distributed inference is as easy as adjusting the environment variables to your setup. For peer-to-peer communication using `iroh`, it's easiest for testing to set seed the public key generation required for connecting the nodes. For example, if you have two nodes, you can run the following command:
+Running distributed inference is as easy as adjusting the environment variables to your setup. For peer-to-peer communication using `iroh`, it's easiest for testing to seed the public key generation required for connecting the nodes. For example, if you have two nodes, set your environment variables as follows:
 
 ```bash
 # On the first node
 export IROH_SEED=0
 export IROH_PEER_ID=ff87a0b0a3c7c0ce827e9cada5ff79e75a44a0633bfcb5b50f99307ddb26b337
-RANK=0 WORLD_SIZE=2 uv run python script/generate.py
+export RANK=0
+export WORLD_SIZE=2
 ```
 
 ```bash
 # On the second node
 export IROH_SEED=1
 export IROH_PEER_ID=ee1aa49a4459dfe813a3cf6eb882041230c7b2558469de81f87c9bf23bf10a03
-RANK=1 WORLD_SIZE=2 uv run python script/generate.py
+export RANK=1
+export WORLD_SIZE=2
 ```
+
+Then, run the following command to start the inference (defaults to `meta-llama/Llama-2-7B-chat-hf`):
+
+```bash
+uv run python script/generate.py
+```
+
+Run `uv run python script/generate.py --help` for more information on the available options.
 
 ## Benchmark
 
