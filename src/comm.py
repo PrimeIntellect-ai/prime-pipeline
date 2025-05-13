@@ -7,7 +7,6 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from prime_iroh import Node
 
 from .logger import get_logger
 from .offload import Offload
@@ -182,6 +181,8 @@ class IrohP2PComm(P2PCommBase):
         self._setup()
 
     def _setup(self):
+        from prime_iroh import Node
+
         # Create node
         seed = os.environ.get("IROH_SEED", None)
         self.node = Node.with_seed(self.num_micro_batches, seed=int(seed) if seed is not None else None)
@@ -194,7 +195,7 @@ class IrohP2PComm(P2PCommBase):
             self.logger.info("Didn't find IROH_PEER_ID environment variable, please enter the peer's public key: ")
             peer_id = input().strip()
         self.logger.info(f"Connecting to {peer_id}")
-        self.node.connect(peer_id)
+        self.node.connect(peer_id, num_retries=1, backoff_ms=1000)
 
         # Wait for connection to be established
         while not self.node.is_ready():

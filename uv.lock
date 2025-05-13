@@ -811,11 +811,11 @@ wheels = [
 
 [[package]]
 name = "prime-iroh"
-version = "0.1.0"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/95/56fb88845d92ee55f1b2619e514dac1d4063888e00b965b9451a323e2cd8/prime_iroh-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:f0026a696f9fd07aa92218ada36fc04a92d9db1fa784d12e6550de1f170d501f", size = 8171304, upload-time = "2025-04-30T21:21:55.582Z" },
-    { url = "https://files.pythonhosted.org/packages/d7/9b/abf714a3680df33ddf11fa0c9fd90eaf477ea49012086607a1c603654097/prime_iroh-0.1.0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:c63f5cfd1e0282f30b5ed9696ed57e75239ef14b59a739bfa8bfa390cecd6426", size = 8171498, upload-time = "2025-04-30T21:09:41.243Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/b8/3883feec0aa68bf5d1871ddf5488a473830f8bc8a28702cb22d6cd70f88a/prime_iroh-0.2.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:85f75ba8e7e9b0030f9872a5bfa1d42ceb639613521db002bbd92e3dd48a3fcc", size = 8790175, upload-time = "2025-05-13T04:02:47.687Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/2e/ff271f94c52b3eef7290308ffabcf6e4ec513fc4812db64c3d12fb683c81/prime_iroh-0.2.0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:8128bd0dd82f5a744fb5eec45ef3b73f418845b624116ae83885f5e302c76b11", size = 8790589, upload-time = "2025-05-13T04:03:10.885Z" },
 ]
 
 [[package]]
@@ -849,7 +849,7 @@ requires-dist = [
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "lovely-tensors", specifier = ">=0.1.18" },
-    { name = "prime-iroh", specifier = ">=0.1.0" },
+    { name = "prime-iroh", specifier = ">=0.2.0" },
     { name = "setuptools", specifier = ">=75.8.2" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "torch", specifier = ">=2.6.0" },

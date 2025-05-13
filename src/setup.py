@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 from .comm import setup_comm
+from .env import setup_env
 from .generate import fake_generate, full_compile
 from .logger import setup_logger
 from .model import get_model, get_model_shard
@@ -43,6 +44,9 @@ def setup(
     # Initialize logger
     logger = setup_logger(rank=rank, log_level=log_level)
     torch.cuda.synchronize()
+
+    # Setup environment variables
+    setup_env()
 
     # Set seeds for reproducibility across all processes
     logger.info(f"Seeding with {seed}")
